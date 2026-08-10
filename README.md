@@ -133,11 +133,21 @@ src/
   analyze/         Stats + explainable rules
   llm/             Local summary + Grok client
   report.rs        Digest formatting
+docs/              Design docs (brief, lab, research agent)
 examples/          Sample exports for a dry run
 open_source_devices/   Planned device hooks + vendor API inventory
 open_medical_papers/   Free/OA medical literature sources (sources.txt)
 data_estimates/        Storage estimates (personal health + research agent)
 ```
+
+## Design docs
+
+Personal product direction (solo use: **brief + lab + research agent**, Amazfit / Google Health primary, universal local hooks) is captured under [`docs/`](docs/):
+
+| Doc | Topic |
+|-----|--------|
+| [docs/schema_cli.md](docs/schema_cli.md) | Schema extensions, brief/lab CLI, config, LLM backends |
+| [docs/research_agent_v0.md](docs/research_agent_v0.md) | Literature harvest, FTS, authenticity, brief/lab attach |
 
 ## Data sources (planned)
 
@@ -151,12 +161,14 @@ Both paths normalize into the same schema; open hardware is preferred for ongoin
 
 ## Roadmap (high level)
 
-- [ ] Define more export format adapters (Apple Health, Google Fit, Fitbit, Oura)
-- [ ] First open-device adapters (see `open_source_devices/`)
-- [ ] Richer time-series / weekly digests
+- [ ] Annotations + N=1 lab + `brief` CLI (see [`docs/schema_cli.md`](docs/schema_cli.md))
+- [ ] Research agent v0 — harvest, FTS, attach to brief/lab (see [`docs/research_agent_v0.md`](docs/research_agent_v0.md))
+- [ ] Amazfit / Gadgetbridge + Google Health Connect export adapters
+- [ ] Universal local hook polish (watch-folder / drop dir)
+- [ ] Pluggable LLM backends (Grok + local OpenAI-compatible)
+- [ ] Weekly brief, digest cache, confidence scoring
 - [ ] Configurable rule thresholds
-- [ ] Optional local-only mode (never call remote LLMs)
-- [ ] Lightweight web UI later
+- [ ] Lightweight web UI later (CLI-first)
 
 ## Disclaimer
 

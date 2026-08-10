@@ -13,6 +13,7 @@ Inventory of **free and open** places to find healthcare / biomedical literature
 - Prefer **peer-reviewed OA** or clear preprint labels when citing methods (e.g. HRV baselines, sleep debt).
 - Check **license** before redistributing PDFs or building datasets.
 - Pair with local analysis: literature informs rules; **your** wearable data stays on your machine.
+- Planned in-repo agent: [`docs/research_agent_v0.md`](../docs/research_agent_v0.md) (harvest, FTS, authenticity, brief/lab attach).
 
 ## Not in scope
 
