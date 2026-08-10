@@ -1,0 +1,25 @@
+{
+  "metrics": [
+    {
+      "date": "2026-07-29",
+      "metric": "readiness_score",
+      "value": 62,
+      "unit": "score",
+      "source": "oura"
+    },
+    {
+      "date": "2026-07-28",
+      "metric": "readiness_score",
+      "value": 68,
+      "unit": "score",
+      "source": "oura"
+    },
+    {
+      "date": "2026-07-27",
+      "metric": "readiness_score",
+      "value": 74,
+      "unit": "score",
+      "source": "oura"
+    }
+  ]
+}

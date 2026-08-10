@@ -1,0 +1,242 @@
+================================================================================
+MEDICAL RESEARCH AGENT — STORAGE ESTIMATES
+(research current literature + evaluate authenticity signals)
+================================================================================
+Project: Personal Groktor (future / adjacent capability)
+Purpose: Size disk for an agent that (1) gathers recent open medical research,
+         (2) indexes it for retrieval, (3) scores authenticity / trust signals
+Date:    2026-08-10
+
+"Authenticity" here means OPEN, LEGITIMATE signals — e.g. peer-review status,
+retraction/expression-of-concern flags, journal policies, preprint vs version
+of record, citation integrity heuristics, author institution metadata, funding
+disclosures — NOT paywall circumvention or shadow libraries.
+
+Figures are ORDER-OF-MAGNITUDE. Scope choices dominate cost more than codecs.
+
+
+--------------------------------------------------------------------------------
+1. WHAT THE AGENT STORES (LAYERS)
+--------------------------------------------------------------------------------
+L0  Query cache          — search API JSON for topics the user cares about
+L1  Paper metadata       — title, abstract, authors, dates, DOI, OA URL, license
+L2  Full text (optional) — HTML/PDF/plain text of OA papers only
+L3  Chunks + embeddings  — vector index for RAG
+L4  Authenticity graph   — retractions, journal metrics, citations, trial links
+L5  Agent artifacts      — eval reports, claim–evidence tables, run logs
+L6  Model weights        — only if a LOCAL LLM is used (optional; often dominant)
+
+
+--------------------------------------------------------------------------------
+2. UNIT COSTS (planning constants)
+--------------------------------------------------------------------------------
+Item                                    | Size (approx)
+----------------------------------------|----------------------------------
+Metadata record (rich JSON)             | 2–8 KB / paper
+Abstract-only text                      | 1–3 KB / paper
+Full-text plain extract                 | 30–150 KB / paper
+PDF (OA article, median-ish)            | 0.4–2.5 MB / paper  (use 1 MB)
+PDF (heavy figures / scan)              | 5–30 MB / paper     (tail)
+Text chunk (~500 tokens)                | ~2 KB
+Embedding 768-d float32                 | 3 KB / vector
+Embedding 1536-d float32                | 6 KB / vector
+Chunks per full paper (typical)         | 15–60  (use 30)
+Chunks per abstract-only                | 1–3
+Retraction / notice record              | < 2 KB
+Journal / venue trust profile           | < 5 KB
+One agent "evaluation report" (MD)      | 5–50 KB
+One research run log                    | 0.1–5 MB
+
+
+Derived:
+  Metadata + abstract:           ~5–10 KB / paper  →  ~5–10 GB / 1M papers
+  Full text plain:               ~80 KB / paper    →  ~80 GB / 1M papers
+  PDF archive:                   ~1 MB / paper     →  ~1 TB / 1M papers
+  Embeddings (30 × 768-d):       ~90 KB / paper    →  ~90 GB / 1M papers
+  Embeddings abstract-only:      ~6–10 KB / paper  →  ~6–10 GB / 1M papers
+
+
+--------------------------------------------------------------------------------
+3. CORPUS SCOPE SCENARIOS ("CURRENT MEDICAL RESEARCH")
+--------------------------------------------------------------------------------
+Biomedical publishing volume is large; the agent should NOT mirror all of PubMed
+by default. Scope by topic + recency.
+
+Scenario S1 — Personal Groktor topic pack (wearables, sleep, HRV, recovery,
+              digital health, consumer CGM context)
+  Papers of interest (rolling 5 years, OA + preprints):   ~5,000 – 30,000
+  Working set after relevance filter:                     ~2,000 – 10,000
+
+Scenario S2 — Broad "digital health + cardiometabolic lifestyle" watch
+  Rolling 3 years, multi-query harvest:                   ~50,000 – 200,000
+
+Scenario S3 — Wide biomedical current awareness (many MeSH areas)
+  Rolling 1–2 years metadata; subset full text:           ~500,000 – 2,000,000
+  (PubMed-scale growth is on the order of ~1M+ records/year globally; only a
+   fraction is OA full text.)
+
+Scenario S4 — Near-mirror of OA full text (PMC subset + preprints)
+  Multi-year OA full text:                                millions of articles
+  Storage moves into multi-TB territory if PDFs kept
+
+
+--------------------------------------------------------------------------------
+4. STORAGE BY SCENARIO (DISK PLANNING)
+--------------------------------------------------------------------------------
+
+========== S1: Topic pack (recommended for single-user Groktor agent) ==========
+Papers: ~10,000 active (midpoint planning)
+
+  L1 Metadata + abstracts:          10k × 8 KB            ≈ 80 MB
+  L2 Full text plain (70% OA):      7k × 80 KB            ≈ 560 MB
+  L2 PDFs optional (70% OA):        7k × 1 MB             ≈ 7 GB
+  L3 Embeddings (full text, 768-d): 7k × 90 KB            ≈ 630 MB
+  L3 Embeddings (abstract fallback):3k × 8 KB             ≈ 24 MB
+  L4 Authenticity DBs (shared):     retraction dumps,     ≈ 0.5 – 5 GB
+                                    journal lists, Crossref
+                                    subset, trial ID map
+  L5 Agent reports (1 year ops):    1k reports × 20 KB    ≈ 20 MB
+  L0 Search/API cache:                                    ≈ 0.5 – 2 GB
+  ---------------------------------------------------------------
+  WITHOUT PDFs (text + vectors):                          ≈ 2 – 4 GB
+  WITH OA PDFs:                                           ≈ 10 – 15 GB
+  Comfortable planning number:                            ≈ 20 GB
+  Headroom for growth / re-index:                         ≈ 50 GB
+
+========== S2: Broad digital-health watch =====================================
+Papers: ~100,000
+
+  Metadata + abstracts:                                   ≈ 0.8 GB
+  Full text plain (~50% OA):                              ≈ 4 GB
+  PDFs optional (~50%):                                   ≈ 50 GB
+  Embeddings full+abstract mix:                           ≈ 5 – 10 GB
+  Authenticity layer (richer citation graph slice):       ≈ 5 – 20 GB
+  ---------------------------------------------------------------
+  WITHOUT PDFs:                                           ≈ 15 – 40 GB
+  WITH PDFs:                                              ≈ 80 – 150 GB
+  Planning number:                                        ≈ 200 GB
+
+========== S3: Wide biomedical current awareness ==============================
+Papers: ~1,000,000 metadata; ~200,000 full text OA
+
+  Metadata + abstracts (1M):                              ≈ 8 GB
+  Full text plain (200k):                                 ≈ 16 GB
+  PDFs (200k):                                            ≈ 200 GB
+  Embeddings (200k full + 800k abstract):                 ≈ 25 – 40 GB
+  Citation / authenticity graph (large slice):            ≈ 50 – 200 GB
+  ---------------------------------------------------------------
+  WITHOUT bulk PDFs:                                      ≈ 100 – 300 GB
+  WITH OA PDFs:                                           ≈ 0.5 – 1 TB
+  Planning number:                                        ≈ 1 TB
+
+========== S4: Institutional OA mirror ========================================
+  Multi-year PMC-scale full text + PDFs + vectors:        ≈ 5 – 50+ TB
+  Out of scope for a personal install
+
+
+--------------------------------------------------------------------------------
+5. AUTHENTICITY / TRUST EVALUATION — STORAGE DETAIL
+--------------------------------------------------------------------------------
+Signal source (examples)              | Typical local size
+--------------------------------------|--------------------------------
+Retraction / concern databases        | 50 MB – 2 GB (with history)
+Journal OA / peer-review policy table | < 100 MB
+Crossref / OpenAlex metadata subset   | 1 – 50 GB (depends on slice)
+Citation edges for working corpus     | 0.5 – 20 GB
+ClinicalTrials.gov links for corpus   | 0.1 – 2 GB
+Predatory-journal heuristic lists     | < 50 MB
+Per-paper authenticity score cache    | ~1 KB × N papers (tiny)
+Human-readable eval writeups          | tens of MB / year
+
+Authenticity layer alone (personal topic pack):     plan ~1 – 5 GB
+Authenticity layer (wide biomedical):               plan ~50 – 200 GB
+
+Note: Authenticity is mostly METADATA + GRAPH, not PDFs. It is cheaper than
+full-text archives and should be prioritized over hoarding PDFs.
+
+
+--------------------------------------------------------------------------------
+6. LOCAL LLM WEIGHTS (OPTIONAL; OFTEN DWARFS THE CORPUS)
+--------------------------------------------------------------------------------
+If the agent calls cloud Grok/xAI only:                 +0 GB model storage
+If small local model (7B quant):                        +4 – 8 GB
+If mid local model (14B–32B quant):                     +8 – 25 GB
+If large local model (70B quant):                       +35 – 45 GB
+
+Recommendation: keep research corpus local; keep LLM remote unless offline
+is required. Then S1 corpus (20 GB) + 7B model (~6 GB) ≈ 30 GB box.
+
+
+--------------------------------------------------------------------------------
+7. NETWORK / REFRESH (not disk, but capacity-related)
+--------------------------------------------------------------------------------
+S1 weekly refresh (metadata + new OA text):     ~50 – 500 MB / week
+S2 continuous harvest:                          ~1 – 10 GB / week (bursty)
+Full PDF re-crawl:                              avoid; fetch on demand
+
+
+--------------------------------------------------------------------------------
+8. RECOMMENDED DEFAULT FOR PERSONAL GROKTOR
+--------------------------------------------------------------------------------
+Goal: agent can research sleep/HRV/wearables/digital-health literature,
+      cite OA sources, and flag retractions / preprint status / weak venues.
+
+  Disk budget:     20 – 50 GB dedicated volume
+  Breakdown:       ~3 GB text+vectors, ~1–5 GB trust DBs, ~10 GB optional PDFs,
+                   ~5–20 GB headroom + caches
+  Cloud LLM:       yes (no local weights)
+  PDF policy:      on-demand for cited papers only (keeps steady state nearer
+                   5–15 GB)
+  Refresh:         weekly metadata; authenticity DB monthly
+
+If also storing Tier-A personal health data: add ~0.1 GB / year (negligible).
+If Tier-B personal exports: add ~2 GB / year beside the research volume.
+
+
+--------------------------------------------------------------------------------
+9. COMBINED PICTURE (ONE PERSON + RESEARCH AGENT)
+--------------------------------------------------------------------------------
+Component                              | Storage
+---------------------------------------|--------------------------------
+Personal health summaries (1 year)     | ~0.1 GB
+Personal wearable exports (1 year)     | ~1–3 GB
+Research agent S1 (steady, no PDF hoard)| ~5–15 GB
+Research agent S1 (with OA PDF cache)  | ~20–50 GB
+Local 7B model (optional)              | ~6 GB
+---------------------------------------|--------------------------------
+Total comfortable personal machine:    | ~30 – 80 GB
+Aggressive local-everything:           | ~200 GB – 1 TB+
+
+
+--------------------------------------------------------------------------------
+10. KEY ASSUMPTIONS & CAVEATS
+--------------------------------------------------------------------------------
+- Only legal OA / licensed / abstract-level content; no shadow libraries.
+- PDF average 1 MB is optimistic for image-heavy clinical articles; tails hurt.
+- Embedding dim and chunking strategy can 2× vector storage easily.
+- "Authenticity" is probabilistic assistance, not a verdict of truth.
+- Systematic reviews and guidelines may matter more than raw paper count —
+  a smaller, curated S1 corpus often beats a huge unclean scrape.
+- API rate limits and ToS may throttle harvest long before disk fills.
+- Medical imaging datasets and EHR corpora are excluded (separate TB–PB world).
+
+
+--------------------------------------------------------------------------------
+11. ONE-LINE SUMMARIES
+--------------------------------------------------------------------------------
+Personal health (Groktor default):     ~100 MB per person per year
+  (or ~1–3 GB/year if keeping full exports).
+
+Medical research agent (topic pack):   ~20 GB planning budget
+  (~5–15 GB if PDFs are on-demand only).
+
+Authenticity layer alone (topic pack): ~1–5 GB.
+
+Wide biomedical agent with OA PDFs:    plan ~1 TB.
+
+Personal health + topic research agent on one box:  comfortably under 100 GB.
+
+
+================================================================================
+END
+================================================================================

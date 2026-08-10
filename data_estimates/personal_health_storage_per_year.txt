@@ -1,0 +1,129 @@
+================================================================================
+PERSONAL HEALTH / WEARABLE STORAGE — ESTIMATES PER PERSON PER YEAR
+================================================================================
+Project: Personal Groktor
+Purpose: Size local SQLite, exports, and optional high-rate sensor archives
+Units:   SI-ish (KB/MB/GB); "year" = 365 days of continuous ownership
+Date:    2026-08-10
+
+These are ORDER-OF-MAGNITUDE estimates. Real devices vary by sample rate,
+whether raw waveforms are kept, compression, and how many modalities you use.
+
+
+--------------------------------------------------------------------------------
+1. WHAT "A YEAR OF DATA" CAN MEAN
+--------------------------------------------------------------------------------
+Tier A — Daily summaries only (matches current Groktor schema direction)
+         Sleep hours, RHR, HRV, steps, calories, weight, readiness, SpO2 daily…
+Tier B — Typical consumer wearable export (minute-level activity + sleep stages
+         + periodic HR; no continuous PPG waveform)
+Tier C — High-fidelity (continuous HR ~1 Hz, workout GPS, optional CGM, ECGs)
+Tier D — Research / raw sensor (PPG/ECG waveforms, multi-sensor IMU)
+
+
+--------------------------------------------------------------------------------
+2. BUILDING BLOCKS (rough sizes)
+--------------------------------------------------------------------------------
+Record type                         | Per day (raw-ish)     | Per year
+------------------------------------|-----------------------|------------------
+~20 daily summary metrics (JSON/SQL)| 2–10 KB               | 1–4 MB
+Minute-level steps/activity         | 50–200 KB             | 20–70 MB
+Sleep stages (epoch 30s–5m)         | 5–30 KB               | 2–10 MB
+Heart rate every 5 seconds          | 0.5–2 MB              | 180–700 MB
+Heart rate ~1 Hz continuous         | 3–10 MB               | 1–4 GB
+RR-interval / beat-to-beat log      | 1–5 MB                | 0.4–2 GB
+Workout GPS (3 h/week active)       | highly variable       | 50–500 MB
+CGM (reading every 5 min)           | 10–40 KB              | 4–15 MB
+Spot ECGs (few per week, PDF/wave)  | —                     | 50–500 MB
+Raw PPG/ECG continuous research     | tens–hundreds MB      | 10–100+ GB
+Phone Health export XML overhead    | —                     | often 2–10× logical
+SQLite indexes + WAL overhead       | —                     | ~1.5–3× row data
+
+
+--------------------------------------------------------------------------------
+3. TIER TOTALS — STORAGE PER PERSON PER YEAR
+--------------------------------------------------------------------------------
+
+TIER A — Daily summaries (Personal Groktor default path)
+  Logical metric rows:     ~5k–20k points/year
+  SQLite (metrics+findings+indexes):     ~5–50 MB
+  Markdown digests (365 days):           ~2–20 MB
+  Optional Grok narrative cache:         ~1–10 MB
+  -------------------------------------------------
+  TOTAL typical:                           ~10–80 MB / year
+  Comfortable planning number:           ~100 MB / year / person
+  10-year archive:                       ~1 GB (summaries only)
+
+TIER B — Typical multi-device consumer export (Fitbit/Oura/Apple-style
+         without keeping raw optical waveforms)
+  Daily + minute series + sleep + workouts summaries:
+  Compressed export (zip/csv):           ~200 MB – 2 GB / year
+  Uncompressed / DB materialization:     ~0.5 – 5 GB / year
+  -------------------------------------------------
+  TOTAL typical:                           ~0.5 – 3 GB / year
+  Planning number:                       ~2 GB / year / person
+  10-year archive:                       ~20 GB
+
+TIER C — High-fidelity lifestyle (continuous HR, GPS training, CGM,
+         occasional ECG; still not raw PPG archive)
+  Continuous HR + activity + CGM + GPS:  ~2 – 15 GB / year
+  With light compression (zstd/parquet): ~0.5 – 5 GB / year
+  -------------------------------------------------
+  TOTAL typical:                           ~3 – 10 GB / year
+  Planning number:                       ~8 GB / year / person
+  10-year archive:                       ~50–100 GB
+
+TIER D — Research-grade raw sensors (continuous PPG/ECG/IMU)
+  Uncompressed multi-channel:            ~20 – 200+ GB / year
+  Compressed research formats:           ~5 – 50 GB / year
+  -------------------------------------------------
+  Planning number:                       ~50 GB / year / person (wide band)
+  Not recommended as default for Groktor local "insight" mode
+
+
+--------------------------------------------------------------------------------
+4. RECOMMENDED PLANNING TARGETS FOR THIS PROJECT
+--------------------------------------------------------------------------------
+Use case                              | Plan storage (per person)
+--------------------------------------|---------------------------
+CLI summaries + rules + digests only  | 100 MB / year  (1 GB / decade)
++ retain vendor export files          | +1–3 GB / year of exports
++ minute-level series for charts      | 2 GB / year
++ continuous HR for custom HRV        | 5–10 GB / year
+Household of 4 (summaries only)       | ~400 MB / year active DB
+Self-hosted multi-user (100 people,   | ~10 GB / year (summaries)
+  summaries only)
+
+
+--------------------------------------------------------------------------------
+5. BANDWIDTH / INGEST (secondary)
+--------------------------------------------------------------------------------
+Daily summary sync:          << 1 MB / day
+Typical export re-download:  100 MB – 2 GB occasional
+Continuous BLE HR logger:    ~3–10 MB / day local write
+
+
+--------------------------------------------------------------------------------
+6. KEY ASSUMPTIONS & CAVEATS
+--------------------------------------------------------------------------------
+- "Per year" assumes continuous wear; real adherence is lower → less data.
+- Vendor exports are often verbose XML/JSON; normalized SQLite is smaller.
+- Findings/rules rows are negligible vs time series.
+- LLM prompts/responses for digests are tiny vs sensor data.
+- Photos/screenshots of dashboards are excluded (user media is separate).
+- Medical imaging (MRI, CT, etc.) is OUT OF SCOPE — those are GB–TB alone
+  and are not part of Personal Groktor's wearable pipeline.
+
+
+--------------------------------------------------------------------------------
+7. ONE-LINE SUMMARY
+--------------------------------------------------------------------------------
+Most Personal Groktor users (daily metrics + digests): about 100 MB per year.
+If they keep full wearable history exports: plan about 1–3 GB per year.
+High-rate continuous sensors without waveforms: plan under ~10 GB per year.
+Raw research waveforms: tens of GB to 100+ GB per year — optional, not default.
+
+
+================================================================================
+END
+================================================================================

@@ -1,0 +1,123 @@
+# Free & open medical / healthcare literature sources
+# For Personal Groktor: discovery, methods, and wellbeing research context.
+# Not medical advice. Prefer primary sources; check each item's license/ToS.
+# Last updated: 2026-08-10
+#
+# Format: Name — URL — notes
+
+================================================================================
+PREPRINT SERVERS (open manuscripts; not always peer-reviewed)
+================================================================================
+bioRxiv — https://www.biorxiv.org/ — life sciences preprints; free to read
+medRxiv — https://www.medrxiv.org/ — clinical / health sciences preprints; free to read
+arXiv (q-bio, stat.ML health-adjacent) — https://arxiv.org/ — open preprints
+OSF Preprints — https://osf.io/preprints/ — multi-discipline; includes health
+Research Square — https://www.researchsquare.com/ — many free preprints (check license)
+SSRN (health economics / policy subsets) — https://www.ssrn.com/ — many free full texts
+
+================================================================================
+FULL-TEXT AGGREGATORS & SEARCH (open access / free full text filters)
+================================================================================
+PubMed Central (PMC) — https://www.ncbi.nlm.nih.gov/pmc/ — free full-text biomedical archive (NIH/NLM)
+PubMed — https://pubmed.ncbi.nlm.nih.gov/ — citation index; filter "Free full text" / PMC links
+Europe PMC — https://europepmc.org/ — free texts + preprints + grants; API available
+Directory of Open Access Journals (DOAJ) — https://doaj.org/ — indexed OA journals
+Unpaywall — https://unpaywall.org/ — finds legal OA copies; browser extension + API
+OpenAlex — https://openalex.org/ — open scholarly graph; free API
+Semantic Scholar — https://www.semanticscholar.org/ — free search; OA pdf links when known
+CORE — https://core.ac.uk/ — open access research aggregator
+OpenAIRE Explore — https://explore.openaire.eu/ — EU open research graph
+BASE (Bielefeld) — https://www.base-search.net/ — academic search; OA filter
+Google Scholar — https://scholar.google.com/ — broad search; OA PDFs when available (not all free)
+Lens.org — https://www.lens.org/ — scholarly + patent works; free tier
+Dimensions (free discovery) — https://www.dimensions.ai/ — limited free access; check current policy
+Epistemonikos — https://www.epistemonikos.org/ — systematic reviews / evidence database (free search)
+Trip Medical Database — https://www.tripdatabase.com/ — clinical search; free tier with filters
+SciELO — https://scielo.org/ — open access journals (Latin America / Iberia / Global South focus)
+African Journals Online (AJOL) — https://www.ajol.info/ — many free/OA African journals
+J-STAGE — https://www.jstage.jst.go.jp/ — Japanese platform; many free articles
+HAL (France) — https://hal.science/ — open archive; includes life sciences
+Zenodo — https://zenodo.org/ — open research data & papers (CERN/OpenAIRE)
+
+================================================================================
+MAJOR OPEN ACCESS PUBLISHERS / PLATFORMS (journal homes)
+================================================================================
+PLOS (Public Library of Science) — https://plos.org/ — fully OA journals (Medicine, Biology, etc.)
+BioMed Central (BMC) — https://www.biomedcentral.com/ — Springer Nature OA imprint
+Frontiers — https://www.frontiersin.org/ — large OA portfolio
+eLife — https://elifesciences.org/ — OA life/biomedical research
+F1000Research — https://f1000research.com/ — OA + open peer review
+Wellcome Open Research — https://wellcomeopenresearch.org/ — funder platform; OA
+Gates Open Research — https://gatesopenresearch.org/ — funder platform; OA
+Open Research Europe — https://open-research-europe.ec.europa.eu/ — EC-funded research OA
+JMIR Publications — https://www.jmir.org/ — digital health / informatics OA focus
+MDPI — https://www.mdpi.com/ — large OA publisher (quality varies by journal; use critically)
+Hindawi (Wiley OA) — https://www.hindawi.com/ — OA journals
+PeerJ — https://peerj.com/ — OA life & health sciences
+Copernicus Publications — https://publications.copernicus.org/ — OA (more Earth/science; some health-adjacent)
+Scientific Reports (Nature Portfolio) — https://www.nature.com/srep/ — OA; broad scope
+Nature Communications — https://www.nature.com/ncomms/ — OA hybrid flagship-style (all OA)
+BMJ Open — https://bmjopen.bmj.com/ — OA medical research
+BMJ Public Health / related OA titles — https://www.bmj.com/company/oa/ — check title list
+The Lancet Regional Health / Gold OA titles — https://www.thelancet.com/ — some fully OA journals
+NEJM evidence / OA content — https://www.nejm.org/ — not fully OA; free articles & delayed access vary
+JAMA Network Open — https://jamanetwork.com/journals/jamanetworkopen — fully OA JAMA family journal
+
+================================================================================
+GUIDELINES, EVIDENCE SYNTHESES, TRIALS (often free to read)
+================================================================================
+Cochrane Library — https://www.cochranelibrary.com/ — systematic reviews; free access varies by country/partner
+WHO IRIS — https://iris.who.int/ — WHO publications & reports (free)
+WHO guidelines — https://www.who.int/publications/who-guidelines — free guideline documents
+NICE guidance (UK) — https://www.nice.org.uk/guidance — free clinical/public health guidance
+CDC Stacks / publications — https://stacks.cdc.gov/ — free US public health documents
+ClinicalTrials.gov — https://clinicaltrials.gov/ — trial registry; free protocols/results when posted
+ICTRP (WHO trial search) — https://www.who.int/clinical-trials-registry-platform — meta-registry search
+OpenTrials / related open trials efforts — https://opentrials.net/ — open trial data projects (check status)
+PROSPERO — https://www.crd.york.ac.uk/prospero/ — systematic review protocols registry
+OSF Registries — https://osf.io/registries — preregistrations including health
+
+================================================================================
+GENOMICS / LIFE-SCIENCE OPEN LITERATURE & DATA PORTALS
+================================================================================
+NIH RePORTER — https://reporter.nih.gov/ — funded projects (not papers, but leads to OA outputs)
+NCBI Bookshelf — https://www.ncbi.nlm.nih.gov/books/ — free biomedical books & documents
+Gene Ontology / literature links — https://geneontology.org/ — gene/function; links to papers
+Europe PMC Grants — via https://europepmc.org/ — funder-linked OA
+
+================================================================================
+DIGITAL HEALTH, WEARABLES, SLEEP, CARDIO (topic-relevant OA homes)
+================================================================================
+JMIR mHealth and uHealth — https://mhealth.jmir.org/ — mobile/wearable health OA
+JMIR Cardio / JMIR Sleep (JMIR portfolio) — https://www.jmir.org/ — search portfolio titles
+npj Digital Medicine — https://www.nature.com/npjdigitalmed/ — OA digital medicine
+PLOS Digital Health — https://journals.plos.org/digitalhealth/ — OA
+Frontiers in Digital Health — https://www.frontiersin.org/journals/digital-health — OA
+Sleep (Oxford) / open articles — https://academic.oup.com/sleep — not fully OA; free papers vary
+Sensors (MDPI) — https://www.mdpi.com/journal/sensors — OA; wearable/hardware papers
+
+================================================================================
+APIS & BULK ACCESS (for future tooling; free tiers)
+================================================================================
+NCBI E-utilities (PubMed/PMC) — https://www.ncbi.nlm.nih.gov/books/NBK25501/ — free API
+Europe PMC REST API — https://europepmc.org/RestfulWebService — free API
+OpenAlex API — https://docs.openalex.org/ — free scholarly API
+Unpaywall API — https://unpaywall.org/products/api — free for non-commercial (check terms)
+Crossref REST API — https://www.crossref.org/documentation/retrieve-metadata/rest-api/ — free metadata
+DOAJ API — https://doaj.org/api/docs — free OA journal/article API
+medRxiv / bioRxiv API & alerts — https://www.biorxiv.org/ — RSS/API options via sites
+Semantic Scholar Academic Graph API — https://www.semanticscholar.org/product/api — free tier
+OpenFDA — https://open.fda.gov/ — drugs/devices adverse events (not papers; health data)
+ClinicalTrials.gov API — https://clinicaltrials.gov/data-api/api — free
+
+================================================================================
+LICENSE / LEGAL REMINDERS (read before bulk download)
+================================================================================
+Creative Commons journal articles — often CC BY / CC BY-NC; respect license
+Publisher ToS — bulk scraping may be restricted even when reading is free
+Sci-Hub / shadow libraries — NOT listed; not a legitimate source for this project
+Author accepted manuscripts via institutional repos — legal OA when deposited under policy
+
+================================================================================
+END
+================================================================================
