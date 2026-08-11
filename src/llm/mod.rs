@@ -4,7 +4,9 @@ mod grok;
 
 pub use grok::GrokClient;
 
-use crate::schema::{Digest, Finding, MetricPoint};
+use crate::schema::{
+    Annotation, ConfidenceLevel, Digest, DigestConfidence, DigestHorizon, Finding, MetricPoint,
+};
 
 /// Build a deterministic local summary without calling an LLM.
 pub fn local_summary(day: chrono::NaiveDate, findings: &[Finding], metric_count: usize) -> String {
@@ -36,9 +38,7 @@ pub fn local_summary(day: chrono::NaiveDate, findings: &[Finding], metric_count:
     if findings.len() > 8 {
         lines.push(format!("- …and {} more", findings.len() - 8));
     }
-    lines.push(
-        "Insights are for personal reflection only — not medical advice.".into(),
-    );
+    lines.push("Insights are for personal reflection only — not medical advice.".into());
     lines.join("\n")
 }
 
@@ -64,7 +64,7 @@ pub fn build_prompt(day_metrics: &[MetricPoint], findings: &[Finding]) -> String
 
     format!(
         r#"You are Personal Groktor, a careful health-data assistant.
-Given one day of wearable metrics and rule-based findings, write a short wellbeing briefing.
+Given wearable metrics and rule-based findings, write a short wellbeing briefing.
 
 Rules:
 - 4–8 sentences, plain language
@@ -81,20 +81,48 @@ Findings:
     )
 }
 
-/// Attach optional LLM narrative onto a digest skeleton.
+/// Attach optional LLM narrative onto a digest skeleton (day horizon, no annotations).
 pub fn digest_from_parts(
     day: chrono::NaiveDate,
     findings: Vec<Finding>,
     metric_count: usize,
     llm_narrative: Option<String>,
 ) -> Digest {
+    digest_from_parts_full(
+        day,
+        findings,
+        vec![],
+        metric_count,
+        llm_narrative,
+        None,
+    )
+}
+
+/// Full digest constructor used by brief/digest commands.
+pub fn digest_from_parts_full(
+    day: chrono::NaiveDate,
+    findings: Vec<Finding>,
+    annotations: Vec<Annotation>,
+    metric_count: usize,
+    llm_narrative: Option<String>,
+    llm_backend: Option<String>,
+) -> Digest {
     let summary = local_summary(day, &findings, metric_count);
     Digest {
         day,
+        horizon: DigestHorizon::Day,
         generated_at: chrono::Utc::now(),
         findings,
+        annotations,
+        active_experiments: vec![],
         summary,
         llm_narrative,
+        llm_backend,
         metric_count,
+        research_bits: vec![],
+        confidence: DigestConfidence {
+            level: ConfidenceLevel::Ok,
+            reasons: vec!["legacy digest path".into()],
+        },
     }
 }

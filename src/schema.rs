@@ -216,15 +216,306 @@ impl std::fmt::Display for Severity {
     }
 }
 
-/// Daily wellbeing digest (rules + optional LLM narrative).
+// ── Annotations ──────────────────────────────────────────────────────────────
+
+/// Manual context for brief and lab (illness, alcohol, travel, mood, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    pub id: Uuid,
+    pub day: NaiveDate,
+    pub recorded_at: DateTime<Utc>,
+    /// Lowercase snake_case tags (e.g. `alcohol`, `travel`, `sick`).
+    pub tags: Vec<String>,
+    pub body: Option<String>,
+    /// Optional 1–5 mood score.
+    pub mood: Option<u8>,
+    /// Optional 1–5 energy score.
+    pub energy: Option<u8>,
+    pub experiment_id: Option<Uuid>,
+    /// `"manual"` or `"import:…"`.
+    pub source: String,
+}
+
+impl Annotation {
+    pub fn new(day: NaiveDate, tags: Vec<String>, body: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            day,
+            recorded_at: Utc::now(),
+            tags: tags
+                .into_iter()
+                .map(|t| t.trim().to_ascii_lowercase().replace([' ', '-'], "_"))
+                .filter(|t| !t.is_empty())
+                .collect(),
+            body,
+            mood: None,
+            energy: None,
+            experiment_id: None,
+            source: "manual".into(),
+        }
+    }
+}
+
+// ── Experiments (N=1 lab) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentStatus {
+    Draft,
+    Active,
+    Paused,
+    Completed,
+    Abandoned,
+}
+
+impl ExperimentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "draft" => Some(Self::Draft),
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "completed" => Some(Self::Completed),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExperimentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Arm {
+    Intervention,
+    Control,
+    Exclude,
+}
+
+impl Arm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intervention => "intervention",
+            Self::Control => "control",
+            Self::Exclude => "exclude",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "intervention" | "i" | "tx" => Some(Self::Intervention),
+            "control" | "c" | "baseline" => Some(Self::Control),
+            "exclude" | "x" | "skip" => Some(Self::Exclude),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Arm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Up,
+    Down,
+    Change,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Change => "change",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "up" | "increase" | "higher" => Some(Self::Up),
+            "down" | "decrease" | "lower" => Some(Self::Down),
+            "change" | "any" | "either" => Some(Self::Change),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeSpec {
+    pub kind: MetricKind,
+    pub direction: Direction,
+    pub primary: bool,
+}
+
+/// N=1 experiment definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Experiment {
+    pub id: Uuid,
+    pub slug: String,
+    pub title: String,
+    pub hypothesis: String,
+    pub status: ExperimentStatus,
+    pub started_on: Option<NaiveDate>,
+    pub ended_on: Option<NaiveDate>,
+    pub outcomes: Vec<OutcomeSpec>,
+    pub min_days: u32,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Explicit arm assignment for a calendar day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentDay {
+    pub experiment_id: Uuid,
+    pub day: NaiveDate,
+    pub arm: Arm,
+    pub note: Option<String>,
+}
+
+// ── Lab report (computed) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeResult {
+    pub kind: MetricKind,
+    pub direction: Direction,
+    pub primary: bool,
+    pub n_intervention: usize,
+    pub n_control: usize,
+    pub mean_intervention: Option<f64>,
+    pub mean_control: Option<f64>,
+    pub median_intervention: Option<f64>,
+    pub median_control: Option<f64>,
+    pub delta: Option<f64>,
+    /// Simple descriptive effect size (Cohen's d-like) when n ≥ 5 per arm.
+    pub effect_size: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabReport {
+    pub experiment: Experiment,
+    pub window: (NaiveDate, NaiveDate),
+    pub n_intervention: usize,
+    pub n_control: usize,
+    pub outcomes: Vec<OutcomeResult>,
+    pub confounds: Vec<String>,
+    pub findings_overlap: Vec<Finding>,
+    pub summary: String,
+    pub llm_narrative: Option<String>,
+    pub research_refs: Vec<ResearchCite>,
+}
+
+// ── Research cite (shared stub; full agent later) ─────────────────────────────
+
+/// Lightweight literature cite attached to brief/lab outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchCite {
+    pub paper_id: String,
+    pub title: String,
+    pub year: Option<i32>,
+    pub venue: Option<String>,
+    pub oa_url: Option<String>,
+    pub is_preprint: bool,
+    pub retracted: bool,
+    pub snippet: Option<String>,
+    pub score: f32,
+}
+
+// ── Digest / brief ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestHorizon {
+    Day,
+    Week { start: NaiveDate },
+}
+
+impl DigestHorizon {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week { .. } => "week",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    Thin,
+    Ok,
+    Rich,
+}
+
+impl ConfidenceLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Thin => "thin",
+            Self::Ok => "ok",
+            Self::Rich => "rich",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfidenceLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestConfidence {
+    pub level: ConfidenceLevel,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentBrief {
+    pub slug: String,
+    pub title: String,
+    /// Day index within the experiment window (1-based), if known.
+    pub day_index: Option<u32>,
+    pub arm_today: Option<Arm>,
+}
+
+/// Daily (or weekly) wellbeing digest — rules + optional LLM + context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Digest {
     pub day: NaiveDate,
+    pub horizon: DigestHorizon,
     pub generated_at: DateTime<Utc>,
     pub findings: Vec<Finding>,
+    pub annotations: Vec<Annotation>,
+    pub active_experiments: Vec<ExperimentBrief>,
     pub summary: String,
     pub llm_narrative: Option<String>,
+    pub llm_backend: Option<String>,
     pub metric_count: usize,
+    pub research_bits: Vec<ResearchCite>,
+    pub confidence: DigestConfidence,
 }
 
 /// Raw row as commonly found in wearable CSV/JSON exports.

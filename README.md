@@ -34,10 +34,12 @@ Rust CLI scaffold is in place:
 - [x] CSV / JSON ingest + normalization
 - [x] Local SQLite storage
 - [x] Rule-based anomaly detection (z-score, sleep debt, RHR after poor sleep, HRV drop, activity drop-off)
-- [x] Local digests + optional xAI Grok narrative
+- [x] Local digests / **brief** + optional xAI Grok narrative
+- [x] Annotations (`note`) + N=1 lab (`lab start|day|report`) + digest cache tables
+- [x] Day and rolling-week briefs with confidence + context
 - [ ] Broader export parsers (Apple Health XML, Fitbit bulk, etc.) — see [`open_source_devices/apis/`](open_source_devices/apis/)
 - [ ] Open device adapters (PineTime, Bangle.js, Gadgetbridge, BLE HR, …) — see [`open_source_devices/`](open_source_devices/)
-- [ ] Weekly rollups and exportable reports polish
+- [ ] Research agent (literature harvest / FTS) — see [`docs/research_agent_v0.md`](docs/research_agent_v0.md)
 - [ ] Optional privacy modes (redaction, local-only metrics)
 
 ## Tech stack
@@ -77,12 +79,23 @@ cargo run -- status
 # Rule-based analysis
 cargo run -- analyze
 
-# Daily digest (latest day; local summary, no API call)
-cargo run -- digest
+# Daily brief (latest day; local summary, no API call)
+cargo run -- brief
+# `digest` remains an alias of `brief`
 
-# Digest for a specific day + Grok narrative
+# Note + N=1 lab
+cargo run -- note --day 2026-07-28 --tag alcohol -m "dinner out"
+cargo run -- lab start early_bed \
+  --title "Earlier bedtime" \
+  --hypothesis "Bed by 22:30 improves next-day HRV" \
+  --outcome hrv:up --primary hrv
+cargo run -- lab day early_bed --day 2026-07-28 --arm intervention
+cargo run -- lab report early_bed
+
+# Brief for a specific day + Grok narrative
 export XAI_API_KEY=your_key_here
-cargo run -- digest --day 2026-07-29 --llm --out /tmp/groktor-digest.md
+cargo run -- brief --day 2026-07-29 --llm --out /tmp/groktor-brief.md
+cargo run -- brief --week --day 2026-07-29
 ```
 
 ### CLI overview
@@ -91,8 +104,11 @@ cargo run -- digest --day 2026-07-29 --llm --out /tmp/groktor-digest.md
 |---------|---------|
 | `ingest <path>` | Load `.csv` or `.json` export into SQLite |
 | `analyze [--from DATE] [--to DATE]` | Run rule engine; store findings |
-| `digest [--day DATE] [--llm] [--out PATH]` | Print / write a wellbeing brief |
-| `status` | Show DB path, metric count, date range |
+| `brief [--day DATE] [--week] [--llm] [--out PATH]` | Day/week wellbeing brief |
+| `digest …` | Alias of `brief` (compat) |
+| `note [--tag …] [-m …]` / `note list` | Log or list annotations |
+| `lab start\|day\|list\|show\|report\|…` | N=1 experiments |
+| `status` | DB path, metrics, notes, labs |
 
 Global option: `--db PATH` (or `GROKTOR_DB`) to override the default database location  
 (`~/.local/share/personal_groktor/data.db` on Linux).
@@ -126,13 +142,15 @@ Common metric aliases (`rhr`, `hrv`, `steps`, …) map to the canonical schema a
 src/
   main.rs          CLI entry
   lib.rs           Library root
-  schema.rs        Metric / finding types
+  schema.rs        Metric, finding, annotation, experiment, digest types
   ingest/          CSV & JSON loaders
   normalize.rs     Raw → canonical metrics
-  store.rs         SQLite persistence
+  store.rs         SQLite persistence (health DB)
   analyze/         Stats + explainable rules
+  brief/           Day/week brief builder + confidence
+  lab/             N=1 experiment helpers + descriptive report
   llm/             Local summary + Grok client
-  report.rs        Digest formatting
+  report.rs        Brief / lab markdown formatting
 docs/              Design docs (brief, lab, research agent)
 examples/          Sample exports for a dry run
 open_source_devices/   Planned device hooks + vendor API inventory
@@ -161,12 +179,12 @@ Both paths normalize into the same schema; open hardware is preferred for ongoin
 
 ## Roadmap (high level)
 
-- [ ] Annotations + N=1 lab + `brief` CLI (see [`docs/schema_cli.md`](docs/schema_cli.md))
+- [x] Annotations + N=1 lab + `brief` CLI (phases A–C in [`docs/schema_cli.md`](docs/schema_cli.md))
 - [ ] Research agent v0 — harvest, FTS, attach to brief/lab (see [`docs/research_agent_v0.md`](docs/research_agent_v0.md))
 - [ ] Amazfit / Gadgetbridge + Google Health Connect export adapters
 - [ ] Universal local hook polish (watch-folder / drop dir)
-- [ ] Pluggable LLM backends (Grok + local OpenAI-compatible)
-- [ ] Weekly brief, digest cache, confidence scoring
+- [ ] Pluggable LLM backends (Grok + local OpenAI-compatible; `--llm local`)
+- [x] Weekly brief, digest cache row, confidence scoring (v0)
 - [ ] Configurable rule thresholds
 - [ ] Lightweight web UI later (CLI-first)
 

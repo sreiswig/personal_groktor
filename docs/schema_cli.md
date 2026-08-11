@@ -1,6 +1,7 @@
 # Schema + CLI design (brief, lab, research hooks)
 
-Status: **design** — not fully implemented.  
+Status: **phases A–C implemented** in `src/` (annotations, lab, brief/digest, lab report).  
+Remaining: D (pluggable LLM backends), E–F (research), G polish.  
 Audience: personal install only.  
 Companion: [research_agent_v0.md](research_agent_v0.md).
 
@@ -365,12 +366,12 @@ personal_groktor [GLOBAL] <command>
 |---------|--------|---------|
 | `ingest <path>` | **exists** | Import CSV/JSON metrics |
 | `analyze` | **exists** | Run rule engine; store findings |
-| `digest` | **exists** → alias of `brief` | Day brief (compat) |
-| `brief` | planned | Day/week wellbeing brief |
-| `note` | planned | Log / list annotations |
-| `lab` | planned | Experiments (start, arms, report) |
+| `digest` | **exists** | Alias of `brief` (compat) |
+| `brief` | **exists** | Day/week wellbeing brief |
+| `note` | **exists** | Log / list annotations |
+| `lab` | **exists** | Experiments (start, arms, report) |
 | `research` | planned | Literature agent (see research doc) |
-| `status` | **exists** → extend | Health + lab + research summary |
+| `status` | **exists** | Health + notes + labs (research TBD) |
 | `sync` | later | Watch-folder / drop-dir ingest |
 
 ### `brief`

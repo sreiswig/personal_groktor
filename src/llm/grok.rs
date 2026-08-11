@@ -45,6 +45,11 @@ impl GrokClient {
         findings: &[Finding],
     ) -> Result<String> {
         let prompt = build_prompt(day_metrics, findings);
+        self.complete_raw(&prompt).await
+    }
+
+    /// Complete a free-form user prompt (system message is fixed non-clinical helper).
+    pub async fn complete_raw(&self, user_prompt: &str) -> Result<String> {
         let body = ChatRequest {
             model: self.model.clone(),
             messages: vec![
@@ -54,7 +59,7 @@ impl GrokClient {
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: prompt,
+                    content: user_prompt.to_string(),
                 },
             ],
             temperature: 0.4,
@@ -79,7 +84,10 @@ impl GrokClient {
         }
 
         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-            GroktorError::Llm(format!("failed to parse Grok response: {e}; body={}", truncate(&text, 200)))
+            GroktorError::Llm(format!(
+                "failed to parse Grok response: {e}; body={}",
+                truncate(&text, 200)
+            ))
         })?;
 
         parsed
