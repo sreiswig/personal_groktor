@@ -1,0 +1,16 @@
+# Dependabot: Rust crates + GitHub Actions (weekly).
+#
+# PREREQUISITE: Cargo.lock must be committed to the repo before cargo
+# Dependabot updates are meaningful. Remove Cargo.lock from .gitignore
+# (done in this PR) and commit the lockfile next.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
