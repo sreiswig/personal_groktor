@@ -24,4 +24,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: |
+          if [ -f Cargo.lock ]; then cargo test --locked; else cargo test; fi
