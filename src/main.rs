@@ -357,6 +357,7 @@ async fn cmd_brief(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_note(
     db: Option<PathBuf>,
     action: Option<NoteCmd>,

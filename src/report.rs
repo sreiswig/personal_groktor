@@ -15,7 +15,7 @@ pub fn format_digest(digest: &Digest) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {title}\n\n"));
     out.push_str(&format!(
-        "_Generated {} · Confidence: {} — {_}\n\n",
+        "_Generated {0} · Confidence: {1} — {2}_\n\n",
         digest.generated_at.format("%Y-%m-%d %H:%M UTC"),
         digest.confidence.level,
         digest.confidence.reasons.join("; ")
@@ -94,7 +94,7 @@ pub fn format_lab_report(report: &LabReport) -> String {
     out.push_str(&format!("# Lab — {}\n\n", report.experiment.slug));
     out.push_str(&format!("**{}**\n\n", report.experiment.title));
     out.push_str(&format!(
-        "_Status: {} · Window: {} → {} · Intervention days: {} · Control days: {_}\n\n",
+        "_Status: {0} · Window: {1} → {2} · Intervention days: {3} · Control days: {4}_\n\n",
         report.experiment.status,
         report.window.0,
         report.window.1,
