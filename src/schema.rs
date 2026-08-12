@@ -99,10 +99,7 @@ impl MetricKind {
 
     /// Map common export column / type names onto canonical kinds.
     pub fn from_raw_name(raw: &str) -> Self {
-        let key = raw
-            .trim()
-            .to_ascii_lowercase()
-            .replace([' ', '-'], "_");
+        let key = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
         match key.as_str() {
             "sleep_duration" | "sleep_duration_hours" | "total_sleep_hours" | "sleep_hours" => {
                 Self::SleepDurationHours
