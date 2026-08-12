@@ -58,7 +58,7 @@ impl GrokClient {
             messages: vec![
                 ChatMessage {
                     role: "system".into(),
-                    content: "You help people understand personal wearable data carefully and non-clinically".into(),
+                    content: "You help people understand personal wearable data carefully and non-clinically.".into(),
                 },
                 ChatMessage {
                     role: "user".into(),
