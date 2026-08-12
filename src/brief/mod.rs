@@ -9,9 +9,7 @@ use chrono::{Duration, NaiveDate, Utc};
 use crate::analyze;
 use crate::error::{GroktorError, Result};
 use crate::llm;
-use crate::schema::{
-    Annotation, Digest, DigestHorizon, ExperimentBrief, Finding, MetricPoint,
-};
+use crate::schema::{Annotation, Digest, DigestHorizon, ExperimentBrief, Finding, MetricPoint};
 use crate::store::Store;
 
 /// Options for building a brief.
@@ -99,9 +97,7 @@ fn resolve_target_day(store: &Store, requested: Option<NaiveDate>) -> Result<Nai
     store
         .day_range()?
         .map(|(_, max)| max)
-        .ok_or_else(|| {
-            GroktorError::Message("No metrics in database. Run `ingest` first.".into())
-        })
+        .ok_or_else(|| GroktorError::Message("No metrics in database. Run `ingest` first.".into()))
 }
 
 fn experiment_briefs(store: &Store, day: NaiveDate) -> Result<Vec<ExperimentBrief>> {
@@ -186,10 +182,7 @@ fn local_brief_summary(
                 .arm_today
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "no arm logged".into());
-            let idx = e
-                .day_index
-                .map(|i| format!(" day {i}"))
-                .unwrap_or_default();
+            let idx = e.day_index.map(|i| format!(" day {i}")).unwrap_or_default();
             lines.push(format!("Lab: {} ({}){idx} — {arm}.", e.slug, e.title));
         }
     }
@@ -216,14 +209,8 @@ pub fn build_brief_prompt(digest: &Digest, day_metrics: &[MetricPoint]) -> Strin
         for a in &digest.annotations {
             let tags = a.tags.join(", ");
             let body = a.body.as_deref().unwrap_or("");
-            let mood = a
-                .mood
-                .map(|m| format!(" mood={m}"))
-                .unwrap_or_default();
-            let energy = a
-                .energy
-                .map(|e| format!(" energy={e}"))
-                .unwrap_or_default();
+            let mood = a.mood.map(|m| format!(" mood={m}")).unwrap_or_default();
+            let energy = a.energy.map(|e| format!(" energy={e}")).unwrap_or_default();
             base.push_str(&format!(
                 "- {}: tags=[{tags}]{mood}{energy} {body}\n",
                 a.day

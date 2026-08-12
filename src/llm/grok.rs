@@ -21,8 +21,7 @@ impl GrokClient {
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("XAI_API_KEY").map_err(|_| {
             GroktorError::Config(
-                "XAI_API_KEY is not set. Export your xAI API key to enable Grok narratives."
-                    .into(),
+                "XAI_API_KEY is not set. Export your xAI API key to enable Grok narratives.".into(),
             )
         })?;
         let base_url = std::env::var("XAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE.into());
@@ -30,7 +29,11 @@ impl GrokClient {
         Ok(Self::new(api_key, base_url, model))
     }
 
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),

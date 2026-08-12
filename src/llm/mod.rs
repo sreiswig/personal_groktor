@@ -53,10 +53,7 @@ pub fn build_prompt(day_metrics: &[MetricPoint], findings: &[Finding]) -> String
     }
     let mut findings_block = String::new();
     for f in findings {
-        findings_block.push_str(&format!(
-            "- [{}] {} — {}\n",
-            f.severity, f.title, f.detail
-        ));
+        findings_block.push_str(&format!("- [{}] {} — {}\n", f.severity, f.title, f.detail));
     }
     if findings_block.is_empty() {
         findings_block.push_str("(none)\n");
@@ -88,14 +85,7 @@ pub fn digest_from_parts(
     metric_count: usize,
     llm_narrative: Option<String>,
 ) -> Digest {
-    digest_from_parts_full(
-        day,
-        findings,
-        vec![],
-        metric_count,
-        llm_narrative,
-        None,
-    )
+    digest_from_parts_full(day, findings, vec![], metric_count, llm_narrative, None)
 }
 
 /// Full digest constructor used by brief/digest commands.

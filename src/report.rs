@@ -2,9 +2,7 @@
 
 use chrono::NaiveDate;
 
-use crate::schema::{
-    Digest, DigestHorizon, Finding, LabReport, ResearchCite, Severity,
-};
+use crate::schema::{Digest, DigestHorizon, Finding, LabReport, ResearchCite, Severity};
 
 pub fn format_digest(digest: &Digest) -> String {
     let title = match digest.horizon {
@@ -17,7 +15,7 @@ pub fn format_digest(digest: &Digest) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {title}\n\n"));
     out.push_str(&format!(
-        "_Generated {} · Confidence: {} — {}_\n\n",
+        "_Generated {} · Confidence: {} — {_}\n\n",
         digest.generated_at.format("%Y-%m-%d %H:%M UTC"),
         digest.confidence.level,
         digest.confidence.reasons.join("; ")
@@ -69,7 +67,10 @@ pub fn format_digest(digest: &Digest) -> String {
                 .day_index
                 .map(|i| format!(" · day {i}"))
                 .unwrap_or_default();
-            out.push_str(&format!("- **{}** ({}){idx} — arm: {arm}\n", e.slug, e.title));
+            out.push_str(&format!(
+                "- **{}** ({}){idx} — arm: {arm}\n",
+                e.slug, e.title
+            ));
         }
     }
 
@@ -93,7 +94,7 @@ pub fn format_lab_report(report: &LabReport) -> String {
     out.push_str(&format!("# Lab — {}\n\n", report.experiment.slug));
     out.push_str(&format!("**{}**\n\n", report.experiment.title));
     out.push_str(&format!(
-        "_Status: {} · Window: {} → {} · Intervention days: {} · Control days: {}_\n\n",
+        "_Status: {} · Window: {} → {} · Intervention days: {} · Control days: {_}\n\n",
         report.experiment.status,
         report.window.0,
         report.window.1,
@@ -190,8 +191,7 @@ fn fmt_opt(v: Option<f64>) -> String {
 }
 
 fn fmt_opt_signed(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:+.2}"))
-        .unwrap_or_else(|| "—".into())
+    v.map(|x| format!("{x:+.2}")).unwrap_or_else(|| "—".into())
 }
 
 fn format_finding(f: &Finding) -> String {

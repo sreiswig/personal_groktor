@@ -198,11 +198,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn metrics_in_range(
-        &self,
-        start: NaiveDate,
-        end: NaiveDate,
-    ) -> Result<Vec<MetricPoint>> {
+    pub fn metrics_in_range(&self, start: NaiveDate, end: NaiveDate) -> Result<Vec<MetricPoint>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, kind, category, recorded_at, day, value, unit, source, raw_name, notes
@@ -246,9 +242,8 @@ impl Store {
         let mut map = std::collections::BTreeMap::new();
         for r in rows {
             let (day_s, value) = r?;
-            let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d").map_err(|e| {
-                GroktorError::Parse(format!("bad day in db: {e}"))
-            })?;
+            let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
+                .map_err(|e| GroktorError::Parse(format!("bad day in db: {e}")))?;
             map.insert(day, value);
         }
         Ok(map.into_iter().collect())
@@ -475,9 +470,8 @@ impl Store {
     }
 
     pub fn require_experiment(&self, slug: &str) -> Result<Experiment> {
-        self.experiment_by_slug(slug)?.ok_or_else(|| {
-            GroktorError::Message(format!("unknown experiment slug: {slug}"))
-        })
+        self.experiment_by_slug(slug)?
+            .ok_or_else(|| GroktorError::Message(format!("unknown experiment slug: {slug}")))
     }
 
     pub fn list_experiments(&self) -> Result<Vec<Experiment>> {
@@ -557,11 +551,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn arm_for_day(
-        &self,
-        experiment_id: Uuid,
-        day: NaiveDate,
-    ) -> Result<Option<Arm>> {
+    pub fn arm_for_day(&self, experiment_id: Uuid, day: NaiveDate) -> Result<Option<Arm>> {
         let arm_s: Option<String> = self
             .conn
             .query_row(
@@ -625,11 +615,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_digest(
-        &self,
-        day: NaiveDate,
-        horizon: &str,
-    ) -> Result<Option<Digest>> {
+    pub fn get_digest(&self, day: NaiveDate, horizon: &str) -> Result<Option<Digest>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT day, horizon, week_start, generated_at, metric_count, summary,
@@ -676,8 +662,8 @@ fn row_to_metric(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
     let kind = MetricKind::from_raw_name(&kind_s);
     let category = MetricCategory::parse(&cat_s);
     let recorded_at = parse_rfc3339(&recorded_at);
-    let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
-        .unwrap_or_else(|_| Utc::now().date_naive());
+    let day =
+        NaiveDate::parse_from_str(&day_s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive());
 
     Ok(MetricPoint {
         id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -710,8 +696,8 @@ fn row_to_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<Finding> {
         "low" => Severity::Low,
         _ => Severity::Info,
     };
-    let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
-        .unwrap_or_else(|_| Utc::now().date_naive());
+    let day =
+        NaiveDate::parse_from_str(&day_s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive());
 
     Ok(Finding {
         id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -738,8 +724,8 @@ fn row_to_annotation(row: &rusqlite::Row<'_>) -> std::result::Result<Annotation,
     let source: String = row.get(8)?;
 
     let tags: Vec<String> = serde_json::from_str(&tags_s).unwrap_or_default();
-    let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
-        .unwrap_or_else(|_| Utc::now().date_naive());
+    let day =
+        NaiveDate::parse_from_str(&day_s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive());
 
     Ok(Annotation {
         id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4()),
@@ -820,8 +806,8 @@ fn row_to_digest(row: &rusqlite::Row<'_>) -> std::result::Result<Digest, rusqlit
     let research_json: Option<String> = row.get(11)?;
     let confidence_json: Option<String> = row.get(12)?;
 
-    let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
-        .unwrap_or_else(|_| Utc::now().date_naive());
+    let day =
+        NaiveDate::parse_from_str(&day_s, "%Y-%m-%d").unwrap_or_else(|_| Utc::now().date_naive());
     let horizon = if horizon_s == "week" {
         let start = week_start
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
@@ -879,14 +865,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("test.db")).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
-        let p = MetricPoint::new(
-            MetricKind::Steps,
-            Utc::now(),
-            day,
-            9000.0,
-            "count",
-            "test",
-        );
+        let p = MetricPoint::new(MetricKind::Steps, Utc::now(), day, 9000.0, "count", "test");
         assert_eq!(store.upsert_metrics(&[p.clone()]).unwrap(), 1);
         assert_eq!(store.upsert_metrics(&[p]).unwrap(), 0);
         assert_eq!(store.metric_count().unwrap(), 1);
@@ -901,7 +880,11 @@ mod tests {
         let store = Store::open(dir.path().join("test.db")).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
 
-        let mut a = Annotation::new(day, vec!["alcohol".into(), "late".into()], Some("wine".into()));
+        let mut a = Annotation::new(
+            day,
+            vec!["alcohol".into(), "late".into()],
+            Some("wine".into()),
+        );
         a.mood = Some(3);
         store.insert_annotation(&a).unwrap();
         assert_eq!(store.annotation_count().unwrap(), 1);
