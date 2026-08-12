@@ -208,7 +208,7 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![start.to_string(), end.to_string()], |row| {
-            Ok(row_to_metric(row)?)
+            row_to_metric(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -257,7 +257,7 @@ impl Store {
             ORDER BY day, kind
             "#,
         )?;
-        let rows = stmt.query_map([], |row| Ok(row_to_metric(row)?))?;
+        let rows = stmt.query_map([], row_to_metric)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -279,7 +279,7 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![start.to_string(), end.to_string()], |row| {
-            Ok(row_to_finding(row)?)
+            row_to_finding(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -358,7 +358,7 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![start.to_string(), end.to_string()], |row| {
-            Ok(row_to_annotation(row)?)
+            row_to_annotation(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -462,7 +462,7 @@ impl Store {
             FROM experiments WHERE slug = ?1
             "#,
         )?;
-        let mut rows = stmt.query_map(params![slug], |row| Ok(row_to_experiment(row)?))?;
+        let mut rows = stmt.query_map(params![slug], row_to_experiment)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
@@ -483,7 +483,7 @@ impl Store {
             ORDER BY created_at DESC
             "#,
         )?;
-        let rows = stmt.query_map([], |row| Ok(row_to_experiment(row)?))?;
+        let rows = stmt.query_map([], row_to_experiment)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -542,7 +542,7 @@ impl Store {
             "#,
         )?;
         let rows = stmt.query_map(params![experiment_id.to_string()], |row| {
-            Ok(row_to_experiment_day(row)?)
+            row_to_experiment_day(row)
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -624,9 +624,7 @@ impl Store {
             FROM digests WHERE day = ?1 AND horizon = ?2
             "#,
         )?;
-        let mut rows = stmt.query_map(params![day.to_string(), horizon], |row| {
-            Ok(row_to_digest(row)?)
-        })?;
+        let mut rows = stmt.query_map(params![day.to_string(), horizon], row_to_digest)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
