@@ -96,7 +96,10 @@ fn sleep_debt(series: &Series) -> Vec<Finding> {
     let mut out = Vec::new();
     let days: Vec<_> = sleep.keys().copied().collect();
     for window in days.windows(3) {
-        let vals: Vec<f64> = window.iter().filter_map(|d| sleep.get(d).copied()).collect();
+        let vals: Vec<f64> = window
+            .iter()
+            .filter_map(|d| sleep.get(d).copied())
+            .collect();
         if vals.len() < 3 {
             continue;
         }
