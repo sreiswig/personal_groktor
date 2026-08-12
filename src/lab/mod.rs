@@ -52,6 +52,7 @@ pub fn mark_primary(outcomes: &mut [OutcomeSpec], primary: Option<&str>) {
     outcomes[0].primary = true;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_experiment(
     store: &Store,
     slug: &str,

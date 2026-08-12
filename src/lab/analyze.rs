@@ -38,7 +38,12 @@ fn build_from_parts(
 
     let mut outcomes = Vec::new();
     for spec in &experiment.outcomes {
-        outcomes.push(compute_outcome(store, spec, &intervention_days, &control_days)?);
+        outcomes.push(compute_outcome(
+            store,
+            spec,
+            &intervention_days,
+            &control_days,
+        )?);
     }
 
     let annotations = store.annotations_in_range(win_start, win_end)?;
@@ -92,11 +97,7 @@ fn compute_outcome(
     intervention: &BTreeSet<NaiveDate>,
     control: &BTreeSet<NaiveDate>,
 ) -> Result<OutcomeResult> {
-    let all_days: Vec<NaiveDate> = intervention
-        .iter()
-        .chain(control.iter())
-        .copied()
-        .collect();
+    let all_days: Vec<NaiveDate> = intervention.iter().chain(control.iter()).copied().collect();
     let (start, end) = match (all_days.iter().min(), all_days.iter().max()) {
         (Some(a), Some(b)) => (*a, *b),
         _ => {
@@ -228,17 +229,11 @@ fn local_lab_summary(
 ) -> String {
     let mut lines = vec![format!(
         "Lab `{}` ({}) — {} intervention day(s), {} control day(s). Hypothesis: {}",
-        experiment.slug,
-        experiment.status,
-        n_iv,
-        n_c,
-        experiment.hypothesis
+        experiment.slug, experiment.status, n_iv, n_c, experiment.hypothesis
     )];
 
     if n_iv == 0 || n_c == 0 {
-        lines.push(
-            "Need both intervention and control arm days before comparing outcomes.".into(),
-        );
+        lines.push("Need both intervention and control arm days before comparing outcomes.".into());
     }
 
     for o in outcomes {
@@ -282,9 +277,7 @@ fn local_lab_summary(
         ));
     }
 
-    lines.push(
-        "Descriptive N=1 only — not a clinical trial; not medical advice.".into(),
-    );
+    lines.push("Descriptive N=1 only — not a clinical trial; not medical advice.".into());
     lines.join("\n")
 }
 

@@ -35,17 +35,30 @@ fn load_fixtures(store: &Store) {
 fn ingest_normalize_store_idempotent() {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path().join("t.db")).unwrap();
-    load_fixtures(&store);
+
+    // Normalize once; re-upsert same MetricPoint ids to exercise INSERT OR IGNORE.
+    // (A second normalize() would mint new UUIDs and would insert again.)
+    let csv = ingest::load_path(std::path::Path::new("examples/sample_metrics.csv")).unwrap();
+    let (points, errs) = normalize::normalize_all(&csv);
+    assert!(errs.is_empty(), "csv normalize errors: {errs:?}");
+    assert_eq!(points.len(), 40);
+    assert_eq!(store.upsert_metrics(&points).unwrap(), 40);
+    assert_eq!(
+        store.upsert_metrics(&points).unwrap(),
+        0,
+        "second upsert of same ids should insert nothing"
+    );
+
+    let json = ingest::load_path(std::path::Path::new("examples/sample_metrics.json")).unwrap();
+    let (jpoints, jerrs) = normalize::normalize_all(&json);
+    assert!(jerrs.is_empty(), "json normalize errors: {jerrs:?}");
+    assert_eq!(jpoints.len(), 3);
+    assert_eq!(store.upsert_metrics(&jpoints).unwrap(), 3);
 
     assert!(store.metric_count().unwrap() >= 43);
     let range = store.day_range().unwrap().expect("day range");
     assert_eq!(range.0, NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
     assert_eq!(range.1, NaiveDate::from_ymd_opt(2026, 7, 29).unwrap());
-
-    let again = ingest::load_path(std::path::Path::new("examples/sample_metrics.csv")).unwrap();
-    let (points, _) = normalize::normalize_all(&again);
-    let n = store.upsert_metrics(&points).unwrap();
-    assert_eq!(n, 0, "second upsert should insert nothing");
 }
 
 #[test]

@@ -150,9 +150,15 @@ enum LabCmd {
         #[arg(long)]
         notes: Option<String>,
     },
-    Pause { slug: String },
-    Resume { slug: String },
-    Complete { slug: String },
+    Pause {
+        slug: String,
+    },
+    Resume {
+        slug: String,
+    },
+    Complete {
+        slug: String,
+    },
     Abandon {
         slug: String,
         #[arg(long)]
@@ -173,7 +179,9 @@ enum LabCmd {
         note: Option<String>,
     },
     List,
-    Show { slug: String },
+    Show {
+        slug: String,
+    },
     /// Descriptive N=1 report
     Report {
         slug: String,
@@ -220,19 +228,7 @@ async fn run() -> personal_groktor::Result<()> {
             llm,
             out,
             refresh,
-        } => {
-            cmd_brief(
-                cli.db,
-                BriefOptions {
-                    day,
-                    week,
-                    refresh,
-                },
-                llm,
-                out,
-            )
-            .await
-        }
+        } => cmd_brief(cli.db, BriefOptions { day, week, refresh }, llm, out).await,
         Commands::Digest { day, llm, out } => {
             cmd_brief(
                 cli.db,
@@ -361,6 +357,7 @@ async fn cmd_brief(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_note(
     db: Option<PathBuf>,
     action: Option<NoteCmd>,
@@ -421,9 +418,7 @@ fn cmd_note(
             lab::assign_day(&store, slug, day, arm, None)?;
         }
     } else if arm.is_some() {
-        return Err(GroktorError::Message(
-            "--arm requires --experiment".into(),
-        ));
+        return Err(GroktorError::Message("--arm requires --experiment".into()));
     }
 
     store.insert_annotation(&ann)?;
@@ -438,9 +433,7 @@ fn cmd_note(
 fn validate_scale(name: &str, v: Option<u8>) -> personal_groktor::Result<()> {
     if let Some(n) = v {
         if !(1..=5).contains(&n) {
-            return Err(GroktorError::Parse(format!(
-                "{name} must be 1–5 (got {n})"
-            )));
+            return Err(GroktorError::Parse(format!("{name} must be 1–5 (got {n})")));
         }
     }
     Ok(())
