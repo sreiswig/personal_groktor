@@ -3,12 +3,12 @@
 use std::path::PathBuf;
 
 use chrono::{NaiveDate, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use personal_groktor::analyze;
 use personal_groktor::brief::{self, BriefOptions};
 use personal_groktor::ingest;
 use personal_groktor::lab;
-use personal_groktor::llm::GrokClient;
+use personal_groktor::llm::{ChatClient, LlmBackend};
 use personal_groktor::normalize;
 use personal_groktor::report;
 use personal_groktor::schema::{Annotation, Arm, ExperimentStatus};
@@ -31,6 +31,22 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum LlmBackendArg {
+    #[default]
+    Grok,
+    Local,
+}
+
+impl From<LlmBackendArg> for LlmBackend {
+    fn from(value: LlmBackendArg) -> Self {
+        match value {
+            LlmBackendArg::Grok => LlmBackend::Grok,
+            LlmBackendArg::Local => LlmBackend::Local,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Import a CSV or JSON health export into the local database
@@ -49,7 +65,7 @@ enum Commands {
         to: Option<NaiveDate>,
     },
 
-    /// Daily/weekly wellbeing brief (rules + context + optional Grok narrative)
+    /// Daily/weekly wellbeing brief (rules + context + optional LLM narrative)
     Brief {
         /// Day to summarize (YYYY-MM-DD); default: latest day with data
         #[arg(long)]
@@ -57,9 +73,12 @@ enum Commands {
         /// Rolling 7-day week ending on --day
         #[arg(long)]
         week: bool,
-        /// Call xAI Grok for a narrative (requires XAI_API_KEY)
+        /// Call an LLM for a narrative (requires backend env; see --llm-backend)
         #[arg(long)]
         llm: bool,
+        /// LLM backend when --llm is set (default: grok)
+        #[arg(long, value_enum, default_value_t = LlmBackendArg::Grok)]
+        llm_backend: LlmBackendArg,
         /// Write markdown report to this path
         #[arg(long)]
         out: Option<PathBuf>,
@@ -74,6 +93,8 @@ enum Commands {
         day: Option<NaiveDate>,
         #[arg(long)]
         llm: bool,
+        #[arg(long, value_enum, default_value_t = LlmBackendArg::Grok)]
+        llm_backend: LlmBackendArg,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -226,10 +247,25 @@ async fn run() -> personal_groktor::Result<()> {
             day,
             week,
             llm,
+            llm_backend,
             out,
             refresh,
-        } => cmd_brief(cli.db, BriefOptions { day, week, refresh }, llm, out).await,
-        Commands::Digest { day, llm, out } => {
+        } => {
+            cmd_brief(
+                cli.db,
+                BriefOptions { day, week, refresh },
+                llm,
+                llm_backend.into(),
+                out,
+            )
+            .await
+        }
+        Commands::Digest {
+            day,
+            llm,
+            llm_backend,
+            out,
+        } => {
             cmd_brief(
                 cli.db,
                 BriefOptions {
@@ -238,6 +274,7 @@ async fn run() -> personal_groktor::Result<()> {
                     refresh: true,
                 },
                 llm,
+                llm_backend.into(),
                 out,
             )
             .await
@@ -315,6 +352,7 @@ async fn cmd_brief(
     db: Option<PathBuf>,
     opts: BriefOptions,
     use_llm: bool,
+    backend: LlmBackend,
     out: Option<PathBuf>,
 ) -> personal_groktor::Result<()> {
     let store = open_store(db)?;
@@ -322,23 +360,24 @@ async fn cmd_brief(
 
     if use_llm {
         let day_metrics = brief::metrics_for_digest(&store, &digest)?;
-        let client = GrokClient::from_env()?;
+        let client = ChatClient::from_backend(backend)?;
         // Prefer extended prompt with annotations when available.
         let prompt = brief::build_brief_prompt(&digest, &day_metrics);
+        let backend_name = backend.as_str();
         match client.complete_raw(&prompt).await {
             Ok(text) => {
                 digest.llm_narrative = Some(text);
-                digest.llm_backend = Some("grok".into());
+                digest.llm_backend = Some(backend_name.into());
             }
             Err(e) => {
                 // Fall back to classic narrate if complete_raw missing path fails oddly
-                tracing::warn!("Grok narrative failed: {e}");
+                tracing::warn!("{backend_name} narrative failed: {e}");
                 match client.narrate(&day_metrics, &digest.findings).await {
                     Ok(text) => {
                         digest.llm_narrative = Some(text);
-                        digest.llm_backend = Some("grok".into());
+                        digest.llm_backend = Some(backend_name.into());
                     }
-                    Err(e2) => tracing::warn!("Grok narrative failed: {e2}"),
+                    Err(e2) => tracing::warn!("{backend_name} narrative failed: {e2}"),
                 }
             }
         }
