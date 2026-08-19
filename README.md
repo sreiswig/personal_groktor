@@ -47,14 +47,14 @@ Rust CLI scaffold is in place:
 - **Language**: Rust
 - **CLI**: [clap](https://docs.rs/clap)
 - **Storage**: SQLite ([rusqlite](https://docs.rs/rusqlite), local file)
-- **LLM**: [Grok](https://x.ai) via xAI API (`XAI_API_KEY`)
+- **LLM**: [Grok](https://x.ai) via xAI API, or any local OpenAI-compatible server (`--llm-backend local`)
 
 ## Getting started
 
 ### Requirements
 
 - Rust 1.75+ (edition 2021)
-- Optional: an [xAI API key](https://console.x.ai/) for Grok narratives
+- Optional: an [xAI API key](https://console.x.ai/) for Grok narratives, or a local OpenAI-compatible server (vLLM, Ollama, …)
 
 ### Build
 
@@ -92,10 +92,16 @@ cargo run -- lab start early_bed \
 cargo run -- lab day early_bed --day 2026-07-28 --arm intervention
 cargo run -- lab report early_bed
 
-# Brief for a specific day + Grok narrative
+# Brief for a specific day + Grok narrative (default backend)
 export XAI_API_KEY=your_key_here
 cargo run -- brief --day 2026-07-29 --llm --out /tmp/groktor-brief.md
 cargo run -- brief --week --day 2026-07-29
+
+# Same on-switch, local OpenAI-compatible server (e.g. Spark vLLM)
+export GROKTOR_LLM_BASE=http://127.0.0.1:8000/v1
+export GROKTOR_LLM_MODEL=your-served-model
+# optional: GROKTOR_LLM_API_KEY (defaults to bearer token `local`)
+cargo run -- brief --llm --llm-backend local
 ```
 
 ### CLI overview
@@ -104,7 +110,7 @@ cargo run -- brief --week --day 2026-07-29
 |---------|---------|
 | `ingest <path>` | Load `.csv` or `.json` export into SQLite |
 | `analyze [--from DATE] [--to DATE]` | Run rule engine; store findings |
-| `brief [--day DATE] [--week] [--llm] [--out PATH]` | Day/week wellbeing brief |
+| `brief [--day DATE] [--week] [--llm] [--llm-backend grok\|local] [--out PATH]` | Day/week wellbeing brief |
 | `digest …` | Alias of `brief` (compat) |
 | `note [--tag …] [-m …]` / `note list` | Log or list annotations |
 | `lab start\|day\|list\|show\|report\|…` | N=1 experiments |
@@ -130,11 +136,18 @@ Common metric aliases (`rhr`, `hrv`, `steps`, …) map to the canonical schema a
 
 | Variable | Meaning |
 |----------|---------|
-| `XAI_API_KEY` | xAI API key (required for `--llm`) |
-| `XAI_BASE_URL` | API base (default `https://api.x.ai/v1`) |
-| `XAI_MODEL` | Model id (default `grok-3`) |
+| `XAI_API_KEY` | xAI API key (required for `--llm` with default `--llm-backend grok`) |
+| `XAI_BASE_URL` | Grok API base (default `https://api.x.ai/v1`) |
+| `XAI_MODEL` | Grok model id (default `grok-3`) |
+| `GROKTOR_LLM_BASE` / `LLM_API_BASE` | Local OpenAI-compatible base URL (required for `--llm-backend local`; no default) |
+| `GROKTOR_LLM_MODEL` / `LLM_MODEL` | Local model id (required for `--llm-backend local`) |
+| `GROKTOR_LLM_API_KEY` / `LLM_API_KEY` | Local bearer token (optional; defaults to `local`) |
 | `GROKTOR_DB` | SQLite path override |
 | `RUST_LOG` | Tracing filter (e.g. `debug`) |
+
+`--llm` is the on-switch for `brief` / `digest`. `--llm-backend` selects the endpoint (default `grok`). Existing Grok usage is unchanged.
+
+For `--llm-backend local`, Groktor POSTs `{base}/chat/completions` and never falls back to a public URL. Point `GROKTOR_LLM_BASE` at a LAN or loopback server such as Spark vLLM (`http://127.0.0.1:8000/v1`).
 
 ## Project layout
 
@@ -149,7 +162,7 @@ src/
   analyze/         Stats + explainable rules
   brief/           Day/week brief builder + confidence
   lab/             N=1 experiment helpers + descriptive report
-  llm/             Local summary + Grok client
+  llm/             Local summary + OpenAI-compatible client (Grok + local)
   report.rs        Brief / lab markdown formatting
 docs/              Design docs (brief, lab, research agent)
 examples/          Sample exports for a dry run
@@ -183,7 +196,7 @@ Both paths normalize into the same schema; open hardware is preferred for ongoin
 - [ ] Research agent v0 — harvest, FTS, attach to brief/lab (see [`docs/research_agent_v0.md`](docs/research_agent_v0.md))
 - [ ] Amazfit / Gadgetbridge + Google Health Connect export adapters
 - [ ] Universal local hook polish (watch-folder / drop dir)
-- [ ] Pluggable LLM backends (Grok + local OpenAI-compatible; `--llm local`)
+- [x] Pluggable LLM backends (Grok + local OpenAI-compatible; `--llm-backend local`)
 - [x] Weekly brief, digest cache row, confidence scoring (v0)
 - [ ] Configurable rule thresholds
 - [ ] Lightweight web UI later (CLI-first)

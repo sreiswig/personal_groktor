@@ -2,7 +2,9 @@
 
 mod grok;
 
-pub use grok::GrokClient;
+pub use grok::{
+    resolve_grok_config, resolve_local_config, ChatClient, ChatConfig, GrokClient, LlmBackend,
+};
 
 use crate::schema::{
     Annotation, ConfidenceLevel, Digest, DigestConfidence, DigestHorizon, Finding, MetricPoint,
