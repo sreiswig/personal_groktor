@@ -82,7 +82,7 @@ enum Commands {
         /// Write markdown report to this path
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Recompute and overwrite digest cache (default: always recompute in v0)
+        /// Recompute and overwrite digest cache (cache is used unless --refresh)
         #[arg(long)]
         refresh: bool,
     },
@@ -383,7 +383,7 @@ async fn cmd_brief(
         }
     }
 
-    let _ = store.upsert_digest(&digest);
+    store.upsert_digest(&digest)?;
     let text = report::format_digest(&digest);
     if let Some(path) = out {
         if let Some(parent) = path.parent() {

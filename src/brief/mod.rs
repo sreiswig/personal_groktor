@@ -13,22 +13,12 @@ use crate::schema::{Annotation, Digest, DigestHorizon, ExperimentBrief, Finding,
 use crate::store::Store;
 
 /// Options for building a brief.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BriefOptions {
     pub day: Option<NaiveDate>,
     pub week: bool,
     /// When true, recompute even if a cached digest exists.
     pub refresh: bool,
-}
-
-impl Default for BriefOptions {
-    fn default() -> Self {
-        Self {
-            day: None,
-            week: false,
-            refresh: true,
-        }
-    }
 }
 
 /// Resolve target day and build a full Digest (local summary; LLM filled by caller).
@@ -40,6 +30,12 @@ pub fn build_brief(store: &Store, opts: &BriefOptions) -> Result<Digest> {
     } else {
         (DigestHorizon::Day, day, day)
     };
+
+    if !opts.refresh {
+        if let Some(cached) = store.get_digest(day, horizon.as_str())? {
+            return Ok(cached);
+        }
+    }
 
     // Baselines need history before the window end.
     let analysis_start = range_start - Duration::days(21);
@@ -235,4 +231,93 @@ pub fn build_brief_prompt(digest: &Digest, day_metrics: &[MetricPoint]) -> Strin
         digest.confidence.reasons.join("; ")
     ));
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::MetricKind;
+    use tempfile::TempDir;
+
+    fn seed_store() -> (TempDir, Store, NaiveDate) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        store
+            .upsert_metrics(&[MetricPoint::new(
+                MetricKind::Steps,
+                Utc::now(),
+                day,
+                8000.0,
+                "count",
+                "test",
+            )])
+            .unwrap();
+        (dir, store, day)
+    }
+
+    #[test]
+    fn default_refresh_is_false() {
+        assert!(!BriefOptions::default().refresh);
+    }
+
+    #[test]
+    fn cache_hit_skips_recompute_and_refresh_forces_new() {
+        let (_dir, store, day) = seed_store();
+        let cached_opts = BriefOptions {
+            day: Some(day),
+            week: false,
+            refresh: false,
+        };
+        let first = build_brief(&store, &cached_opts).unwrap();
+        store.upsert_digest(&first).unwrap();
+
+        // A later metric must not appear on a cache hit (proves analyze was skipped).
+        store
+            .upsert_metrics(&[MetricPoint::new(
+                MetricKind::RestingHeartRateBpm,
+                Utc::now(),
+                day,
+                56.0,
+                "bpm",
+                "test",
+            )])
+            .unwrap();
+
+        let hit = build_brief(&store, &cached_opts).unwrap();
+        assert_eq!(hit.generated_at, first.generated_at);
+        assert_eq!(hit.metric_count, first.metric_count);
+        assert_eq!(hit.summary, first.summary);
+
+        let refreshed = build_brief(
+            &store,
+            &BriefOptions {
+                day: Some(day),
+                week: false,
+                refresh: true,
+            },
+        )
+        .unwrap();
+        assert_ne!(refreshed.generated_at, first.generated_at);
+        assert!(refreshed.metric_count > first.metric_count);
+    }
+
+    #[test]
+    fn upsert_digest_surfaces_db_errors() {
+        let (_dir, store, day) = seed_store();
+        let digest = build_brief(
+            &store,
+            &BriefOptions {
+                day: Some(day),
+                week: false,
+                refresh: true,
+            },
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute_batch("DROP TABLE digests;").unwrap();
+        drop(conn);
+        let err = store.upsert_digest(&digest).unwrap_err();
+        assert!(matches!(err, GroktorError::Db(_)));
+    }
 }
