@@ -320,4 +320,34 @@ mod tests {
         let err = store.upsert_digest(&digest).unwrap_err();
         assert!(matches!(err, GroktorError::Db(_)));
     }
+
+    #[test]
+    fn cache_hit_keeps_stored_llm_backend_and_narrative() {
+        let (_dir, store, day) = seed_store();
+        let mut first = build_brief(
+            &store,
+            &BriefOptions {
+                day: Some(day),
+                week: false,
+                refresh: true,
+            },
+        )
+        .unwrap();
+        first.llm_backend = Some("local".into());
+        first.llm_narrative = Some("spark brief".into());
+        store.upsert_digest(&first).unwrap();
+
+        let hit = build_brief(
+            &store,
+            &BriefOptions {
+                day: Some(day),
+                week: false,
+                refresh: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(hit.llm_backend.as_deref(), Some("local"));
+        assert_eq!(hit.llm_narrative.as_deref(), Some("spark brief"));
+        assert_eq!(hit.generated_at, first.generated_at);
+    }
 }
