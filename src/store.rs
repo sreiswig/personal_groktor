@@ -855,7 +855,7 @@ fn row_to_digest(row: &rusqlite::Row<'_>) -> std::result::Result<Digest, rusqlit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Direction, MetricKind};
+    use crate::schema::{ConfidenceLevel, Direction, MetricKind};
     use tempfile::TempDir;
 
     #[test]
@@ -926,5 +926,60 @@ mod tests {
         );
         let (active, completed) = store.experiment_counts().unwrap();
         assert_eq!((active, completed), (1, 0));
+    }
+
+    fn sample_digest(day: NaiveDate, backend: Option<&str>, narrative: Option<&str>) -> Digest {
+        Digest {
+            day,
+            horizon: DigestHorizon::Day,
+            generated_at: parse_rfc3339("2026-08-01T12:00:00Z"),
+            findings: vec![],
+            annotations: vec![],
+            active_experiments: vec![],
+            summary: "local summary".into(),
+            llm_narrative: narrative.map(str::to_string),
+            llm_backend: backend.map(str::to_string),
+            metric_count: 1,
+            research_bits: vec![],
+            confidence: DigestConfidence {
+                level: ConfidenceLevel::Ok,
+                reasons: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn digest_cache_roundtrips_llm_backend_and_narrative() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+
+        store
+            .upsert_digest(&sample_digest(day, Some("local"), Some("spark brief")))
+            .unwrap();
+        let got = store.get_digest(day, "day").unwrap().expect("cached");
+        assert_eq!(got.llm_backend.as_deref(), Some("local"));
+        assert_eq!(got.llm_narrative.as_deref(), Some("spark brief"));
+
+        store
+            .upsert_digest(&sample_digest(day, Some("grok"), None))
+            .unwrap();
+        let got = store.get_digest(day, "day").unwrap().expect("cached");
+        assert_eq!(got.llm_backend.as_deref(), Some("grok"));
+        assert_eq!(got.llm_narrative, None);
+
+        store
+            .upsert_digest(&sample_digest(day, None, Some("rules only")))
+            .unwrap();
+        let got = store.get_digest(day, "day").unwrap().expect("cached");
+        assert_eq!(got.llm_backend, None);
+        assert_eq!(got.llm_narrative.as_deref(), Some("rules only"));
+
+        store
+            .upsert_digest(&sample_digest(day, None, None))
+            .unwrap();
+        let got = store.get_digest(day, "day").unwrap().expect("cached");
+        assert_eq!(got.llm_backend, None);
+        assert_eq!(got.llm_narrative, None);
     }
 }
