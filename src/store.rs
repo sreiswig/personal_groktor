@@ -128,7 +128,7 @@ impl Store {
         Ok(())
     }
 
-    // ── Metrics ──────────────────────────────────────────────────────
+    // ── Metrics ──────────────────────────────────────────────────────────────
 
     /// Insert metrics; skip duplicates by id. Returns number newly inserted.
     pub fn upsert_metrics(&self, points: &[MetricPoint]) -> Result<usize> {
@@ -319,7 +319,7 @@ impl Store {
         }
     }
 
-    // ── Annotations ────────────────────────────────────────────────────
+    // ── Annotations ──────────────────────────────────────────────────────────
 
     pub fn insert_annotation(&self, a: &Annotation) -> Result<()> {
         let tags = serde_json::to_string(&a.tags)?;
@@ -394,7 +394,7 @@ impl Store {
         Ok(n as usize)
     }
 
-    // ── Experiments ──────────────────────────────────────────────────
+    // ── Experiments ──────────────────────────────────────────────────────────
 
     pub fn insert_experiment(&self, e: &Experiment) -> Result<()> {
         let outcomes = serde_json::to_string(&e.outcomes)?;
@@ -563,7 +563,7 @@ impl Store {
         Ok(arm_s.and_then(|s| Arm::parse(&s)))
     }
 
-    // ── Digests cache ────────────────────────────────────────────────
+    // ── Digests cache ────────────────────────────────────────────────────────
 
     pub fn upsert_digest(&self, d: &Digest) -> Result<()> {
         let horizon = d.horizon.as_str();
@@ -632,7 +632,7 @@ impl Store {
     }
 }
 
-// ── Row mappers ─────────────────────────────────────────────────────
+// ── Row mappers ──────────────────────────────────────────────────────────────
 
 fn parse_day(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
