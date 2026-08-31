@@ -2,6 +2,7 @@
 name = "personal_groktor"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
 description = "Turn personal health data into clear, actionable insight with local analysis and Grok"
 license = "MIT"
 readme = "README.md"
