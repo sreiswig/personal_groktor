@@ -16,9 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Vulnerable: dtolnay/rust-toolchain@stable installs latest stable
+      # (today 1.98) and ignores rust-toolchain.toml 1.86.0 — rusqlite 0.40
+      # (PR #8, MSRV 1.88) can look green here while 1.86 would fail.
+      # Secure: install the same pin as rust-toolchain.toml + rustfmt/clippy.
+      - uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: rustfmt, clippy
+      - name: Toolchain
+        run: rustc --version && rustfmt --version
       - name: Format
         run: cargo fmt --check
       - name: Clippy
