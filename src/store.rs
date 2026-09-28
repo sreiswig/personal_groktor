@@ -864,7 +864,7 @@ mod tests {
         let store = Store::open(dir.path().join("test.db")).unwrap();
         let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
         let p = MetricPoint::new(MetricKind::Steps, Utc::now(), day, 9000.0, "count", "test");
-        assert_eq!(store.upsert_metrics(&[p.clone()]).unwrap(), 1);
+        assert_eq!(store.upsert_metrics(std::slice::from_ref(&p)).unwrap(), 1);
         assert_eq!(store.upsert_metrics(&[p]).unwrap(), 0);
         assert_eq!(store.metric_count().unwrap(), 1);
         let got = store.metrics_in_range(day, day).unwrap();

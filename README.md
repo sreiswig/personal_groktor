@@ -53,7 +53,7 @@ Rust CLI scaffold is in place:
 
 ### Requirements
 
-- Rust 1.75+ (edition 2021)
+- Rust 1.98.1 (edition 2021; pinned in `rust-toolchain.toml`)
 - Optional: an [xAI API key](https://console.x.ai/) for Grok narratives, or a local OpenAI-compatible server (vLLM, Ollama, …)
 
 ### Build
