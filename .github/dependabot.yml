@@ -1,14 +1,25 @@
 # Dependabot: Rust crates + GitHub Actions (weekly).
 #
-# PREREQUISITE: Cargo.lock must be committed to the repo before cargo
-# Dependabot updates are meaningful. Remove Cargo.lock from .gitignore
-# (done in this PR) and commit the lockfile next.
+# Cargo.lock is committed, so cargo updates apply to the lockfile.
+# Semver-major cargo version updates are ignored; a human decides MSRV
+# and breaking bumps. Minor and patch cargo updates are grouped.
 version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
