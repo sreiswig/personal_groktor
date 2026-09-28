@@ -73,10 +73,10 @@ fn sample_rules_and_brief() {
     let findings = analyze::analyze(&points);
     let ids: Vec<_> = findings.iter().map(|f| f.rule_id.as_str()).collect();
     assert!(
-        ids.iter().any(|id| *id == "sleep_debt_3d")
-            || ids.iter().any(|id| *id == "hrv_drop")
-            || ids.iter().any(|id| *id == "activity_dropoff")
-            || ids.iter().any(|id| *id == "rhr_after_poor_sleep"),
+        ids.contains(&"sleep_debt_3d")
+            || ids.contains(&"hrv_drop")
+            || ids.contains(&"activity_dropoff")
+            || ids.contains(&"rhr_after_poor_sleep"),
         "expected sample-window rule hits, got {ids:?}"
     );
 
