@@ -3,6 +3,7 @@
 # Cargo.lock is committed, so cargo updates apply to the lockfile.
 # Semver-major cargo version updates are ignored; a human decides MSRV
 # and breaking bumps. Minor and patch cargo updates are grouped.
+# Free-tier only — no paid GHAS / Dependency Review / larger runners.
 version: 2
 updates:
   - package-ecosystem: "cargo"
@@ -25,3 +26,18 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # dtolnay/rust-toolchain@<version> is pinned to match rust-toolchain.toml
+      # (currently 1.98.1) and ci.yml, and is bumped by hand together with them.
+      # Its refs are toolchain versions (1.x), so a semver-major ignore alone
+      # would not catch bumps like 1.98.1 -> 1.120.0.
+      - dependency-name: "dtolnay/rust-toolchain"
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
