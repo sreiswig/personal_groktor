@@ -22,6 +22,9 @@ permissions:
 jobs:
   sbom:
     runs-on: ubuntu-latest
+    # Caps hung steps once a runner picks the job up (observed ~1.5 min).
+    # Does NOT bound time spent queued waiting for a runner.
+    timeout-minutes: 15
     # contents: write only so release runs can attach the SBOM asset.
     # PRs/pushes still upload a workflow artifact with the default token.
     # No security-events: that would be GitHub code scanning (GHAS on private).
