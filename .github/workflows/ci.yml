@@ -14,6 +14,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Caps hung steps once a runner picks the job up (observed ~1 min; headroom for cold cargo builds).
+    # Does NOT bound time spent queued waiting for a runner.
+    timeout-minutes: 20
     steps:
       # Vulnerable: floating actions/checkout@v7 can retarget under us.
       # Secure: immutable SHA matching sbom.yml (tag v7.0.1).
