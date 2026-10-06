@@ -3,6 +3,8 @@
 # Cargo.lock is committed, so cargo updates apply to the lockfile.
 # Semver-major cargo version updates are ignored; a human decides MSRV
 # and breaking bumps. Minor and patch cargo updates are grouped.
+# GitHub Actions majors are grouped (not ignored) into one PR for manual
+# review; see the github-actions entry below.
 # Free-tier only — no paid GHAS / Dependency Review / larger runners.
 version: 2
 updates:
@@ -26,6 +28,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Majors are grouped, not ignored. Workflow actions are SHA-pinned, and
+    # GitHub sends no Dependabot alerts for SHA-pinned actions, so version
+    # updates are the only signal they are falling behind. An ignore rule also
+    # suppresses security updates, so ignoring majors would let them go stale.
+    # Majors arrive batched in one PR for manual review.
     groups:
       github-actions-minor-patch:
         patterns:
@@ -33,11 +40,14 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      github-actions-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
     ignore:
       # dtolnay/rust-toolchain@<version> is pinned to match rust-toolchain.toml
       # (currently 1.98.1) and ci.yml, and is bumped by hand together with them.
-      # Its refs are toolchain versions (1.x), so a semver-major ignore alone
-      # would not catch bumps like 1.98.1 -> 1.120.0.
+      # Its refs are toolchain versions (1.x), so version updates for it are
+      # ignored entirely.
       - dependency-name: "dtolnay/rust-toolchain"
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
