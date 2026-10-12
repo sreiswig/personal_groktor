@@ -1,5 +1,8 @@
 //! OpenAI-compatible chat completions client (xAI Grok + local).
 
+use std::net::IpAddr;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::build_prompt;
@@ -9,6 +12,8 @@ use crate::schema::{Finding, MetricPoint};
 const DEFAULT_GROK_BASE: &str = "https://api.x.ai/v1";
 const DEFAULT_GROK_MODEL: &str = "grok-3";
 const DEFAULT_LOCAL_KEY: &str = "local";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Which LLM endpoint `brief --llm` / `digest --llm` should call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,11 +83,70 @@ pub fn resolve_grok_config(
             "XAI_API_KEY is not set. Export your xAI API key to enable Grok narratives.".into(),
         )
     })?;
+    let base_url = nonempty(base_url).unwrap_or_else(|| DEFAULT_GROK_BASE.into());
+    ensure_grok_base_url(&base_url)?;
     Ok(ChatConfig {
         api_key,
-        base_url: nonempty(base_url).unwrap_or_else(|| DEFAULT_GROK_BASE.into()),
+        base_url,
         model: nonempty(model).unwrap_or_else(|| DEFAULT_GROK_MODEL.into()),
     })
+}
+
+/// Grok sends `XAI_API_KEY` as a bearer token. Require HTTPS unless the host is
+/// loopback so that key never travels in the clear to a remote host.
+fn ensure_grok_base_url(base_url: &str) -> Result<()> {
+    if grok_base_url_allowed(base_url) {
+        return Ok(());
+    }
+    Err(GroktorError::Config(format!(
+        "Grok base URL must use https unless the host is loopback \
+         (localhost, 127.0.0.0/8, or ::1); refusing `{base_url}` so the API key \
+         is not sent over plaintext HTTP"
+    )))
+}
+
+fn grok_base_url_allowed(base_url: &str) -> bool {
+    let Some((scheme, rest)) = base_url.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    scheme.eq_ignore_ascii_case("http") && http_host_is_loopback(rest)
+}
+
+fn http_host_is_loopback(after_scheme: &str) -> bool {
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return false;
+    }
+    let hostport = match authority.rsplit_once('@') {
+        Some((_, hostport)) => hostport,
+        None => authority,
+    };
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if !(after.is_empty() || after.starts_with(':')) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = hostport.split_once(':') {
+        if port.contains(':') {
+            return false;
+        }
+        host
+    } else {
+        hostport
+    };
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(host.parse::<IpAddr>(), Ok(ip) if ip.is_loopback())
 }
 
 /// Local OpenAI-compatible env: base + model required; key defaults to `local`.
@@ -172,8 +236,16 @@ impl ChatClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model,
             backend,
-            http: reqwest::Client::new(),
+            http: Self::build_http_client(),
         }
+    }
+
+    fn build_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("HTTP client with fixed connect and request timeouts")
     }
 
     pub fn backend(&self) -> LlmBackend {
@@ -273,7 +345,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // `floor_char_boundary` never cuts inside a multibyte scalar, so a
+        // response body cannot panic this helper (which would take down brief).
+        let end = s.floor_char_boundary(max);
+        format!("{}…", &s[..end])
     }
 }
 
@@ -354,5 +429,96 @@ mod tests {
         let client = ChatClient::new("sk", "https://api.x.ai/v1/", "grok-3");
         assert_eq!(client.backend(), LlmBackend::Grok);
         assert_eq!(client.base_url(), "https://api.x.ai/v1");
+    }
+
+    #[test]
+    fn truncate_is_char_safe_for_ascii_short_and_multibyte_cuts() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("", 4), "");
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello world", 5), "hello…");
+
+        // 你 is 3 bytes (E4 BD A0). Index 2 falls inside that scalar.
+        let cjk = "a你b";
+        assert_eq!(cjk.len(), 5);
+        assert!(!cjk.is_char_boundary(2));
+        assert_eq!(truncate(cjk, 2), "a…");
+        assert_eq!(truncate(cjk, 4), "a你…");
+
+        // 😀 is 4 bytes. Index 3 falls inside that scalar.
+        let emoji = "go😀!";
+        assert_eq!(emoji.len(), 7);
+        assert!(!emoji.is_char_boundary(3));
+        assert_eq!(truncate(emoji, 1), "g…");
+        assert_eq!(truncate(emoji, 3), "go…");
+        assert_eq!(truncate(emoji, 6), "go😀…");
+        assert_eq!(truncate("😀", 2), "…");
+    }
+
+    #[test]
+    fn grok_base_url_requires_https_unless_loopback() {
+        let cfg = resolve_grok_config(Some("sk-test".into()), None, None).unwrap();
+        assert_eq!(cfg.base_url, DEFAULT_GROK_BASE);
+        assert_eq!(cfg.model, DEFAULT_GROK_MODEL);
+
+        let cfg = resolve_grok_config(
+            Some("sk-test".into()),
+            Some("https://example.invalid/v1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url, "https://example.invalid/v1");
+
+        let cfg = resolve_grok_config(
+            Some("sk-test".into()),
+            Some("HTTPS://api.x.ai/v1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url, "HTTPS://api.x.ai/v1");
+
+        for loopback in [
+            "http://localhost:8080/v1",
+            "http://LOCALHOST/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.1.2.3/v1",
+            "http://[::1]:8080/v1",
+            "http://[::1]/v1",
+        ] {
+            let cfg =
+                resolve_grok_config(Some("sk-test".into()), Some(loopback.into()), None).unwrap();
+            assert_eq!(cfg.base_url, loopback, "{loopback}");
+        }
+
+        for remote in [
+            "http://api.example.com/v1",
+            "http://192.168.1.10:8000/v1",
+            "http://127.0.0.1.example.com/v1",
+            "http://localhost.example.com/v1",
+            "http://[::1]@evil.example/v1",
+        ] {
+            let err =
+                resolve_grok_config(Some("sk-test".into()), Some(remote.into()), None).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("https"), "{remote}: {msg}");
+            assert!(msg.contains("plaintext HTTP"), "{remote}: {msg}");
+            assert!(msg.contains(remote), "{remote}: {msg}");
+        }
+    }
+
+    #[test]
+    fn local_backend_allows_plaintext_http_on_lan_tailscale_and_loopback() {
+        for base in [
+            "http://127.0.0.1:8000/v1",
+            "http://[::1]:8000/v1",
+            "http://192.168.1.20:8000/v1",
+            "http://10.1.2.3:8000/v1",
+            "http://100.64.1.5:8000/v1",
+        ] {
+            let cfg = resolve_local_config(Some(base.into()), Some("spark".into()), None).unwrap();
+            assert_eq!(cfg.base_url, base);
+            assert_eq!(cfg.api_key, DEFAULT_LOCAL_KEY);
+            assert_eq!(cfg.model, "spark");
+        }
     }
 }
