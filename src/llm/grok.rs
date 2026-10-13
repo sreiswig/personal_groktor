@@ -92,61 +92,71 @@ pub fn resolve_grok_config(
     })
 }
 
-/// Grok sends `XAI_API_KEY` as a bearer token. Require HTTPS unless the host is
-/// loopback so that key never travels in the clear to a remote host.
+/// Grok sends `XAI_API_KEY` as a bearer token. Require HTTPS unless the host
+/// `reqwest` will actually dial is loopback, so that key never travels in the
+/// clear to a remote host. The check uses [`reqwest::Url`] (the client's
+/// WHATWG parser), not a hand-rolled authority split.
 fn ensure_grok_base_url(base_url: &str) -> Result<()> {
-    if grok_base_url_allowed(base_url) {
-        return Ok(());
-    }
-    Err(GroktorError::Config(format!(
-        "Grok base URL must use https unless the host is loopback \
-         (localhost, 127.0.0.0/8, or ::1); refusing `{base_url}` so the API key \
-         is not sent over plaintext HTTP"
-    )))
-}
-
-fn grok_base_url_allowed(base_url: &str) -> bool {
-    let Some((scheme, rest)) = base_url.split_once("://") else {
-        return false;
+    let url = match reqwest::Url::parse(base_url) {
+        Ok(url) => url,
+        Err(_) => return Err(grok_base_url_rejected(None)),
     };
-    if scheme.eq_ignore_ascii_case("https") {
-        return true;
-    }
-    scheme.eq_ignore_ascii_case("http") && http_host_is_loopback(rest)
-}
-
-fn http_host_is_loopback(after_scheme: &str) -> bool {
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return false;
-    }
-    let hostport = match authority.rsplit_once('@') {
-        Some((_, hostport)) => hostport,
-        None => authority,
-    };
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        let Some((host, after)) = rest.split_once(']') else {
-            return false;
-        };
-        if !(after.is_empty() || after.starts_with(':')) {
-            return false;
-        }
-        host
-    } else if let Some((host, port)) = hostport.split_once(':') {
-        if port.contains(':') {
-            return false;
-        }
-        host
+    if grok_parsed_url_allowed(&url) {
+        Ok(())
     } else {
-        hostport
-    };
-    if host.is_empty() {
+        Err(grok_base_url_rejected(Some(&url)))
+    }
+}
+
+fn grok_parsed_url_allowed(url: &reqwest::Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
         return false;
     }
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+    match url.scheme() {
+        "https" => true,
+        "http" => http_host_is_loopback(url),
+        _ => false,
     }
-    matches!(host.parse::<IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
+/// `domain()` is `Some` only for the domain variant of [`reqwest::Url::host`].
+/// IP hosts use that parsed address, so a decimal form such as `2130706433`
+/// is judged as `127.0.0.1` rather than as the raw token.
+fn http_host_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host() else {
+        return false;
+    };
+    if let Some(domain) = url.domain() {
+        return domain.eq_ignore_ascii_case("localhost");
+    }
+    let rendered = host.to_string();
+    let text = rendered
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&rendered);
+    matches!(text.parse::<IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
+fn grok_base_url_rejected(parsed: Option<&reqwest::Url>) -> GroktorError {
+    let refusal = match parsed.map(endpoint_for_error) {
+        Some(endpoint) => format!(" Refusing `{endpoint}`."),
+        None => String::new(),
+    };
+    GroktorError::Config(format!(
+        "Grok base URL must use https unless the host is loopback \
+         (localhost, 127.0.0.0/8, or ::1), with no username or password, \
+         so the API key is not sent over plaintext HTTP.{refusal}"
+    ))
+}
+
+/// `scheme://host[:port]` only. [`reqwest::Url`]'s own serialization includes
+/// userinfo, so config errors must not use it.
+fn endpoint_for_error(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
 }
 
 /// Local OpenAI-compatible env: base + model required; key defaults to `local`.
@@ -242,6 +252,7 @@ impl ChatClient {
 
     fn build_http_client() -> reqwest::Client {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -484,26 +495,67 @@ mod tests {
             "http://127.1.2.3/v1",
             "http://[::1]:8080/v1",
             "http://[::1]/v1",
+            // WHATWG normalizes this decimal IPv4 to 127.0.0.1.
+            "http://2130706433/v1",
         ] {
             let cfg =
                 resolve_grok_config(Some("sk-test".into()), Some(loopback.into()), None).unwrap();
             assert_eq!(cfg.base_url, loopback, "{loopback}");
         }
 
-        for remote in [
-            "http://api.example.com/v1",
-            "http://192.168.1.10:8000/v1",
-            "http://127.0.0.1.example.com/v1",
-            "http://localhost.example.com/v1",
-            "http://[::1]@evil.example/v1",
+        for (remote, origin) in [
+            ("http://api.example.com/v1", "http://api.example.com"),
+            ("http://192.168.1.10:8000/v1", "http://192.168.1.10:8000"),
+            (
+                "http://127.0.0.1.example.com/v1",
+                "http://127.0.0.1.example.com",
+            ),
+            (
+                "http://localhost.example.com/v1",
+                "http://localhost.example.com",
+            ),
+            (
+                "http://localhost.attacker.tld/v1",
+                "http://localhost.attacker.tld",
+            ),
+            ("http://127.0.0.1.nip.io/v1", "http://127.0.0.1.nip.io"),
+            ("http://[::1]@evil.example/v1", "http://evil.example"),
+            ("http://localhost@evil.example/v1", "http://evil.example"),
+            ("http://user:pw@localhost/v1", "http://localhost"),
+            ("http://evil.example\\@localhost/v1", "http://evil.example"),
         ] {
             let err =
                 resolve_grok_config(Some("sk-test".into()), Some(remote.into()), None).unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("https"), "{remote}: {msg}");
             assert!(msg.contains("plaintext HTTP"), "{remote}: {msg}");
-            assert!(msg.contains(remote), "{remote}: {msg}");
+            assert!(msg.contains(origin), "{remote}: {msg}");
+            assert!(!msg.contains(remote), "{remote}: {msg}");
+            assert!(!msg.contains('@'), "{remote}: {msg}");
+            assert!(!msg.contains("pw"), "{remote}: {msg}");
+            assert!(!msg.contains('\\'), "{remote}: {msg}");
         }
+    }
+
+    #[test]
+    fn truncate_max_zero() {
+        assert_eq!(truncate("abc", 0), "…");
+        assert_eq!(truncate("", 0), "");
+        assert_eq!(truncate("😀", 0), "…");
+    }
+
+    #[test]
+    fn grok_base_url_edge_cases() {
+        let ok = |u: &str| resolve_grok_config(Some("k".into()), Some(u.into()), None).is_ok();
+        assert!(ok("http://127.0.0.2/v1"));
+        assert!(ok("HTTP://127.0.0.1:8080/v1"));
+        assert!(ok("Http://localhost/v1"));
+        assert!(!ok("HTTP://api.example.com/v1"));
+        assert!(!ok("http://localhost.evil.com/v1"));
+        assert!(!ok("http://user@127.0.0.1/v1"));
+        assert!(ok("http://localhost:8080/v1/"));
+        let c = ChatClient::new("k", "http://localhost:8080/v1///", "m");
+        assert_eq!(c.base_url(), "http://localhost:8080/v1");
     }
 
     #[test]
