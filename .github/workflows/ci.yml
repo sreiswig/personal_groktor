@@ -13,7 +13,7 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Caps hung steps once a runner picks the job up (observed ~1 min; headroom for cold cargo builds).
     # Does NOT bound time spent queued waiting for a runner.
     timeout-minutes: 20
