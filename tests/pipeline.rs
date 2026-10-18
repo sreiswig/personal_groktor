@@ -8,7 +8,8 @@ use personal_groktor::lab;
 use personal_groktor::normalize;
 use personal_groktor::schema::{Arm, MetricKind};
 use personal_groktor::Store;
-use tempfile::TempDir;
+use std::io::Write;
+use tempfile::{NamedTempFile, TempDir};
 
 fn load_fixtures(store: &Store) {
     let csv = ingest::load_path(std::path::Path::new("examples/sample_metrics.csv"))
@@ -135,4 +136,47 @@ fn lab_happy_path() {
 
     let report = lab::build_lab_report(&store, "early_bed").expect("lab report");
     let _ = report;
+}
+
+#[test]
+fn non_finite_csv_rows_are_reported_and_finite_rows_stored() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("t.db")).unwrap();
+
+    let mut csv = NamedTempFile::with_suffix(".csv").unwrap();
+    writeln!(
+        csv,
+        "date,metric,value,unit,source\n\
+         2026-08-01,steps,8000,count,fitbit\n\
+         2026-08-01,rhr,NaN,bpm,oura\n\
+         2026-08-02,hrv,inf,ms,oura\n\
+         2026-08-02,sleep_hours,-inf,hours,oura\n\
+         2026-08-03,steps,9100,count,fitbit"
+    )
+    .unwrap();
+
+    let raw = ingest::load_path(csv.path()).expect("load mixed csv");
+    let (points, errors) = normalize::normalize_all(&raw);
+    assert_eq!(
+        errors,
+        vec![
+            "row 1: Parse error: non-finite value NaN for metric 'rhr'".to_string(),
+            "row 2: Parse error: non-finite value inf for metric 'hrv'".to_string(),
+            "row 3: Parse error: non-finite value -inf for metric 'sleep_hours'".to_string(),
+        ]
+    );
+    assert_eq!(points.len(), 2);
+    assert!(points.iter().all(|p| p.value.is_finite()));
+
+    assert_eq!(store.upsert_metrics(&points).unwrap(), 2);
+    let stored = store
+        .metrics_in_range(
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|p| p.value.is_finite()));
+    let values: Vec<f64> = stored.iter().map(|p| p.value).collect();
+    assert_eq!(values, vec![8000.0, 9100.0]);
 }
