@@ -67,6 +67,16 @@ fn parse_timestamp(s: &str, fallback_day: NaiveDate) -> Result<DateTime<Utc>> {
 
 /// Normalize a single raw row into a metric point.
 pub fn normalize_row(row: &RawMetricRow) -> Result<MetricPoint> {
+    // Non-finite values parse as f64 (CSV `NaN` / `inf` / `-inf`) but poison
+    // means and make rule comparisons silently false. Reject the row instead.
+    if !row.value.is_finite() {
+        let value = row.value;
+        let metric = row.metric.as_str();
+        return Err(GroktorError::Parse(format!(
+            "non-finite value {value} for metric '{metric}'"
+        )));
+    }
+
     let day = parse_day(&row.date)?;
     let recorded_at = match &row.timestamp {
         Some(ts) if !ts.is_empty() => parse_timestamp(ts, day)?,
@@ -108,6 +118,18 @@ pub fn normalize_all(rows: &[RawMetricRow]) -> (Vec<MetricPoint>, Vec<String>) {
 mod tests {
     use super::*;
 
+    fn raw(date: &str, metric: &str, value: f64) -> RawMetricRow {
+        RawMetricRow {
+            date: date.into(),
+            timestamp: None,
+            metric: metric.into(),
+            value,
+            unit: None,
+            source: None,
+            notes: None,
+        }
+    }
+
     #[test]
     fn normalizes_common_aliases() {
         let row = RawMetricRow {
@@ -123,5 +145,47 @@ mod tests {
         assert_eq!(p.kind, MetricKind::RestingHeartRateBpm);
         assert_eq!(p.unit, "bpm");
         assert_eq!(p.day, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        for (value, shown) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            let row = raw("2026-08-01", "resting_hr", value);
+            let err = normalize_row(&row).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("Parse error: non-finite value {shown} for metric 'resting_hr'")
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_all_reports_non_finite_rows_and_keeps_finite_ones() {
+        let rows = vec![
+            raw("2026-08-01", "steps", 8000.0),
+            raw("2026-08-01", "rhr", f64::NAN),
+            raw("2026-08-02", "hrv", f64::INFINITY),
+            raw("not-a-date", "steps", 1.0),
+            raw("2026-08-03", "sleep_hours", f64::NEG_INFINITY),
+            raw("2026-08-03", "steps", 9100.0),
+        ];
+        let (points, errors) = normalize_all(&rows);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].value, 8000.0);
+        assert_eq!(points[0].kind, MetricKind::Steps);
+        assert_eq!(points[1].value, 9100.0);
+        assert_eq!(
+            errors,
+            vec![
+                "row 1: Parse error: non-finite value NaN for metric 'rhr'".to_string(),
+                "row 2: Parse error: non-finite value inf for metric 'hrv'".to_string(),
+                "row 3: Parse error: unrecognized date: not-a-date".to_string(),
+                "row 4: Parse error: non-finite value -inf for metric 'sleep_hours'".to_string(),
+            ]
+        );
     }
 }
