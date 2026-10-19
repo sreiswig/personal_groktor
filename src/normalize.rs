@@ -5,6 +5,25 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use crate::error::{GroktorError, Result};
 use crate::schema::{MetricKind, MetricPoint, RawMetricRow};
 
+/// Make an untrusted string safe for a single log line: escape control
+/// characters (\n, \r, \t, ESC, ...) and cap the length.
+pub(crate) fn sanitize_for_log(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(s.len().min(MAX) + 8);
+    for (i, c) in s.chars().enumerate() {
+        if i == MAX {
+            out.push('\u{2026}');
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Default unit for a metric when the export omits one.
 fn default_unit(kind: &MetricKind) -> &'static str {
     match kind {
@@ -38,7 +57,10 @@ fn parse_day(s: &str) -> Result<NaiveDate> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc).date_naive());
     }
-    Err(GroktorError::Parse(format!("unrecognized date: {s}")))
+    Err(GroktorError::Parse(format!(
+        "unrecognized date: {}",
+        sanitize_for_log(s)
+    )))
 }
 
 fn parse_timestamp(s: &str, fallback_day: NaiveDate) -> Result<DateTime<Utc>> {
@@ -71,7 +93,7 @@ pub fn normalize_row(row: &RawMetricRow) -> Result<MetricPoint> {
     // means and make rule comparisons silently false. Reject the row instead.
     if !row.value.is_finite() {
         let value = row.value;
-        let metric = row.metric.as_str();
+        let metric = sanitize_for_log(&row.metric);
         return Err(GroktorError::Parse(format!(
             "non-finite value {value} for metric '{metric}'"
         )));
@@ -187,5 +209,74 @@ mod tests {
                 "row 4: Parse error: non-finite value -inf for metric 'sleep_hours'".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn non_finite_metric_name_cannot_inject_log_lines() {
+        let row = raw("2026-08-01", "rhr\n2026 INFO forged\x1b[2J", f64::NAN);
+        let err = normalize_row(&row).unwrap_err().to_string();
+        assert!(!err.contains('\n'), "error must stay on one line: {err:?}");
+        assert!(
+            !err.contains('\x1b'),
+            "error must not contain a raw ESC: {err:?}"
+        );
+        assert!(
+            err.contains(r"rhr\n2026 INFO forged\u{1b}[2J"),
+            "controls should be escaped, not dropped: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_date_escapes_embedded_newline() {
+        let row = raw("2026-08-01\nINFO forged", "steps", 1.0);
+        let err = normalize_row(&row).unwrap_err().to_string();
+        assert!(!err.contains('\n'), "error must stay on one line: {err:?}");
+        assert!(
+            err.contains(r"unrecognized date: 2026-08-01\nINFO forged"),
+            "newline in the date should be escaped: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_log_passes_plain_ascii() {
+        assert_eq!(sanitize_for_log("resting_hr"), "resting_hr");
+    }
+
+    #[test]
+    fn sanitize_for_log_escapes_cr_lf_tab() {
+        assert_eq!(sanitize_for_log("a\r\n\tb"), r"a\r\n\tb");
+    }
+
+    #[test]
+    fn sanitize_for_log_truncates_at_64_with_ellipsis() {
+        let sixty_four = "a".repeat(64);
+        assert_eq!(sanitize_for_log(&sixty_four), sixty_four);
+
+        let out = sanitize_for_log(&"b".repeat(80));
+        assert_eq!(out.chars().count(), 65);
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(out.chars().take(64).collect::<String>(), "b".repeat(64));
+    }
+
+    #[test]
+    fn sanitize_for_log_counts_chars_not_bytes() {
+        // 'é' is two UTF-8 bytes. Forty of them exceed 64 bytes but stay under
+        // the 64-character cap, so the string is returned unchanged.
+        let under = "é".repeat(40);
+        assert!(under.len() > 64);
+        assert_eq!(under.chars().count(), 40);
+        assert_eq!(sanitize_for_log(&under), under);
+
+        // Sixty-five multibyte chars truncate on the character boundary.
+        let over = "é".repeat(65);
+        let out = sanitize_for_log(&over);
+        assert_eq!(out.chars().count(), 65);
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(out.chars().take(64).collect::<String>(), "é".repeat(64));
+    }
+
+    #[test]
+    fn sanitize_for_log_empty_string() {
+        assert_eq!(sanitize_for_log(""), "");
     }
 }
