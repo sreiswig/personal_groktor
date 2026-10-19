@@ -223,10 +223,11 @@ fn cohens_d(a: &[f64], b: &[f64]) -> Option<f64> {
     let na = a.len() as f64;
     let nb = b.len() as f64;
     let pooled = (((na - 1.0) * sa * sa + (nb - 1.0) * sb * sb) / (na + nb - 2.0)).sqrt();
-    if pooled < 1e-12 {
+    if !pooled.is_finite() || pooled < 1e-12 {
         return None;
     }
-    Some((ma - mb) / pooled)
+    let d = (ma - mb) / pooled;
+    d.is_finite().then_some(d)
 }
 
 fn detect_confounds(
@@ -570,6 +571,27 @@ mod tests {
         let flat_result = compute_outcome(&spec, &flat, &iv, &cv);
         assert!((flat_result.delta.unwrap() - (10.0 - 30.0)).abs() < 1e-9);
         assert!(flat_result.effect_size.is_none());
+    }
+
+    #[test]
+    fn huge_finite_samples_do_not_yield_nan_effect_size() {
+        let spec = hrv_up();
+        let mut series = BTreeMap::new();
+        let iv: BTreeSet<_> = (0..5).map(day).collect();
+        let cv: BTreeSet<_> = (10..15).map(day).collect();
+        for d in &iv {
+            series.insert(*d, 1e308);
+        }
+        for d in &cv {
+            series.insert(*d, -1e308);
+        }
+        let result = compute_outcome(&spec, &series, &iv, &cv);
+        assert!(result.mean_intervention.is_some_and(|v| !v.is_nan()));
+        assert!(result.mean_control.is_some_and(|v| !v.is_nan()));
+        assert!(result.delta.is_some_and(|v| !v.is_nan()));
+        assert!(result.median_intervention.is_some_and(|v| !v.is_nan()));
+        assert!(result.median_control.is_some_and(|v| !v.is_nan()));
+        assert!(!result.effect_size.is_some_and(|v| v.is_nan()));
     }
 
     #[test]
