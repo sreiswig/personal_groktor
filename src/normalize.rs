@@ -65,17 +65,29 @@ fn parse_timestamp(s: &str, fallback_day: NaiveDate) -> Result<DateTime<Utc>> {
     Ok(Utc.from_utc_datetime(&ndt))
 }
 
+/// Finite metric values are safe to store and to feed into mean / z-score.
+///
+/// CSV parsing accepts `NaN` / `inf` / `-inf` as `f64`. Normalize, direct
+/// inserts, database reads, and the rule engine all use this predicate.
+pub(crate) fn metric_value_accepted(value: f64) -> bool {
+    value.is_finite()
+}
+
+pub(crate) fn reject_non_finite_metric(value: f64, metric: &str) -> Result<()> {
+    if metric_value_accepted(value) {
+        Ok(())
+    } else {
+        Err(GroktorError::Parse(format!(
+            "non-finite value {value} for metric '{metric}'"
+        )))
+    }
+}
+
 /// Normalize a single raw row into a metric point.
 pub fn normalize_row(row: &RawMetricRow) -> Result<MetricPoint> {
     // Non-finite values parse as f64 (CSV `NaN` / `inf` / `-inf`) but poison
     // means and make rule comparisons silently false. Reject the row instead.
-    if !row.value.is_finite() {
-        let value = row.value;
-        let metric = row.metric.as_str();
-        return Err(GroktorError::Parse(format!(
-            "non-finite value {value} for metric '{metric}'"
-        )));
-    }
+    reject_non_finite_metric(row.value, row.metric.as_str())?;
 
     let day = parse_day(&row.date)?;
     let recorded_at = match &row.timestamp {
