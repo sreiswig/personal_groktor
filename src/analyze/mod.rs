@@ -4,6 +4,7 @@ mod rules;
 mod stats;
 
 pub use rules::run_rules;
+pub(crate) use stats::clamp_overflow_quotient;
 pub use stats::{mean, std_dev, z_score};
 
 use chrono::NaiveDate;

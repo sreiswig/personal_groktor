@@ -29,11 +29,27 @@ pub fn std_dev(values: &[f64]) -> Option<f64> {
     }
 }
 
+/// Clamp an overflowed quotient.
+///
+/// `None` only when `quotient` is NaN. A finite numerator divided by a tiny
+/// finite denominator overflows to ±inf. Main treated that ±inf as a real
+/// score (`|inf| >= 2` still fires `zscore_outlier`). Clamp to ±[`f64::MAX`]
+/// so the same comparisons succeed and the stored score stays finite.
+pub(crate) fn clamp_overflow_quotient(quotient: f64) -> Option<f64> {
+    if quotient.is_nan() {
+        None
+    } else if quotient.is_infinite() {
+        Some(quotient.signum() * f64::MAX)
+    } else {
+        Some(quotient)
+    }
+}
+
 /// Population-style z-score of `value` against sample `values` (excludes value itself if desired by caller).
 ///
-/// Returns `None` when the sample is empty, any input is non-finite, the
-/// standard deviation is below `1e-9` (including zero), or the quotient is
-/// itself non-finite (overflow).
+/// Returns `None` when the sample is empty, any input is non-finite, or the
+/// standard deviation is non-finite or below `1e-9` (including zero).
+/// An infinite quotient is clamped to ±[`f64::MAX`]; only a NaN quotient is `None`.
 pub fn z_score(value: f64, values: &[f64]) -> Option<f64> {
     if !metric_value_accepted(value) || !all_accepted(values) {
         return None;
@@ -43,12 +59,7 @@ pub fn z_score(value: f64, values: &[f64]) -> Option<f64> {
     if !s.is_finite() || s < 1e-9 {
         return None;
     }
-    let z = (value - m) / s;
-    if z.is_finite() {
-        Some(z)
-    } else {
-        None
-    }
+    clamp_overflow_quotient((value - m) / s)
 }
 
 #[cfg(test)]
@@ -79,5 +90,9 @@ mod tests {
         assert!(!mean(&[1e308, 1e308]).is_some_and(|m| m.is_nan()));
         assert!(!std_dev(&[1e308, 1e308]).is_some_and(|s| s.is_nan()));
         assert!(!z_score(0.0, &[1e308; 7]).is_some_and(|z| z.is_nan()));
+        // sd ≈ 0.548, so ±1e308 / sd overflows. Keep the sign; do not drop it.
+        let repro = [60.0, 61.0, 60.0, 61.0, 60.0];
+        assert_eq!(z_score(1e308, &repro), Some(f64::MAX));
+        assert_eq!(z_score(-1e308, &repro), Some(-f64::MAX));
     }
 }

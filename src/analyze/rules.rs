@@ -309,6 +309,40 @@ mod tests {
     }
 
     #[test]
+    fn overflowed_z_score_still_alerts_elevated_on_day_6() {
+        // sd of 60, 61, 60, 61, 60 is about 0.548, so (1e308 - mean) / sd
+        // overflows to +inf. Main returned Some(inf) and flagged day 6.
+        let mut rhr = BTreeMap::new();
+        for (i, value) in [60.0, 61.0, 60.0, 61.0, 60.0].into_iter().enumerate() {
+            rhr.insert(d((i + 1) as u32), value);
+        }
+        rhr.insert(d(6), 1e308);
+        let mut series = BTreeMap::new();
+        series.insert(MetricKind::RestingHeartRateBpm, rhr);
+        let findings = run_rules(&series);
+        let alerts: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "zscore_outlier")
+            .collect();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "rules: {:?}",
+            findings
+                .iter()
+                .map(|f| (&f.day, f.rule_id.as_str(), f.title.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(alerts[0].day, d(6));
+        assert!(
+            alerts[0].title.contains("elevated"),
+            "title {}",
+            alerts[0].title
+        );
+        assert_eq!(alerts[0].value, Some(1e308));
+    }
+
+    #[test]
     fn non_finite_samples_do_not_alert_and_do_not_hide_a_finite_drop() {
         let mut hrv = BTreeMap::new();
         for day in 1..=7 {
@@ -395,19 +429,69 @@ mod tests {
         Some(values.iter().sum::<f64>() / values.len() as f64)
     }
 
-    fn oracle_z(value: f64, baseline: &[f64]) -> Option<f64> {
+    /// Raw `(value - mean) / sd`. An infinite quotient stays ±inf.
+    ///
+    /// `None` only when there is no usable sd: too few points, a non-finite
+    /// input, a non-finite sd, or sd below `1e-9`. That is the pre-existing
+    /// zero-spread guard, not "a non-finite quotient means no alert".
+    fn raw_z(value: f64, baseline: &[f64]) -> Option<f64> {
         if baseline.len() < 2 || !value.is_finite() || baseline.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        let m = oracle_mean(baseline)?;
-        let var =
-            baseline.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (baseline.len() as f64 - 1.0);
+        let n = baseline.len() as f64;
+        let m = baseline.iter().sum::<f64>() / n;
+        if !m.is_finite() {
+            return None;
+        }
+        let var = baseline.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (n - 1.0);
         let s = var.sqrt();
         if !s.is_finite() || s < 1e-9 {
             return None;
         }
-        let z = (value - m) / s;
-        z.is_finite().then_some(z)
+        Some((value - m) / s)
+    }
+
+    /// Whether the outlier rule should fire, from the raw quotient.
+    ///
+    /// ±inf alerts (`|inf| >= 2` in the rule). A NaN quotient does not.
+    /// This does not treat every non-finite quotient as "no score".
+    fn z_outlier_expected(value: f64, baseline: &[f64]) -> bool {
+        baseline.len() >= 5
+            && matches!(
+                raw_z(value, baseline),
+                Some(z) if z.is_infinite() || z.abs() >= 2.0
+            )
+    }
+
+    fn assert_z_alert(baseline: &[f64], value: f64) {
+        let z = raw_z(value, baseline).unwrap_or_else(|| {
+            panic!("no raw z for {value} against {baseline:?}");
+        });
+        assert!(
+            z_outlier_expected(value, baseline),
+            "raw z={z} for {value} should alert"
+        );
+        let mut rows: Vec<(i64, f64)> = baseline
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as i64, *v))
+            .collect();
+        let day = rows.len() as i64;
+        rows.push((day, value));
+        expect_rule(
+            &series_of(MetricKind::RestingHeartRateBpm, &rows),
+            "zscore_outlier",
+            day_from(day),
+        );
+        let got = z_score(value, baseline).unwrap_or_else(|| {
+            panic!("z_score dropped outlier {value} (raw z={z})");
+        });
+        assert!(!got.is_nan());
+        if z.is_infinite() {
+            assert_eq!(got, z.signum() * f64::MAX);
+        } else {
+            assert!((got - z).abs() <= 1e-6 * z.abs().max(1.0));
+        }
     }
 
     fn should_hrv_drop(baseline: &[f64], value: f64) -> bool {
@@ -448,30 +532,46 @@ mod tests {
             f64::MIN,
         ];
 
-        // Z-score: modest spread so every extreme is a real finite outlier.
+        // Z-score: modest spread so every extreme is a real outlier.
+        // sd here is about 1.87, so 1e308 / sd stays finite.
         let z_base = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
         for value in extremes {
-            let z = oracle_z(value, &z_base).unwrap_or_else(|| {
-                panic!("expected a finite z-score for {value} against {z_base:?}")
-            });
-            assert!(z.abs() >= 2.0, "{value} z={z} should clear the threshold");
-            let mut rows: Vec<(i64, f64)> = z_base
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i64, *v))
-                .collect();
-            let day = rows.len() as i64;
-            rows.push((day, value));
-            expect_rule(
-                &series_of(MetricKind::RestingHeartRateBpm, &rows),
-                "zscore_outlier",
-                day_from(day),
-            );
-            let got = z_score(value, &z_base).unwrap_or_else(|| {
-                panic!("z_score dropped a finite outlier {value}");
-            });
-            assert!(!got.is_nan());
-            assert!((got - z).abs() <= 1e-6 * z.abs().max(1.0));
+            assert_z_alert(&z_base, value);
+        }
+
+        // Tiny but usable sd: ( ±1e308 - mean ) / sd overflows to ±inf.
+        // The repro baseline has sd ≈ 0.548. The 1e-8 spike has sd ≈ 4.5e-9,
+        // just above the 1e-9 floor.
+        let overflow_bases = [
+            vec![60.0, 61.0, 60.0, 61.0, 60.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1e-8],
+        ];
+        for base in &overflow_bases {
+            for value in [1e308, -1e308] {
+                let z = raw_z(value, base).unwrap_or_else(|| {
+                    panic!("expected a quotient for {value} vs {base:?}");
+                });
+                assert!(
+                    z.is_infinite(),
+                    "baseline {base:?} value {value} should overflow, z={z}"
+                );
+                assert_z_alert(base, value);
+            }
+        }
+        let mut tiny = Lcg(0x71_7E_5D_u64);
+        for _ in 0..12 {
+            let delta = 1e-6 * (1.0 + tiny.next_unit() * 1e3);
+            let base = [0.0, 0.0, 0.0, 0.0, delta];
+            for value in [1e308, -1e308] {
+                let z = raw_z(value, &base).unwrap_or_else(|| {
+                    panic!("expected a quotient for delta {delta}");
+                });
+                assert!(
+                    z.is_infinite(),
+                    "delta {delta} value {value} should overflow, z={z}"
+                );
+                assert_z_alert(&base, value);
+            }
         }
 
         // HRV drop, including a subnormal baseline and an overflowing 1e308 baseline.
@@ -542,8 +642,11 @@ mod tests {
             }
             let base: Vec<f64> = z_rows.iter().map(|(_, v)| *v).collect();
             let outlier = -50.0 - lcg.next_unit() * 100.0;
-            let z = oracle_z(outlier, &base).expect("lcg baseline should have a finite z");
-            assert!(z.abs() >= 2.0);
+            let z = raw_z(outlier, &base).expect("lcg baseline should produce a quotient");
+            assert!(
+                z_outlier_expected(outlier, &base),
+                "lcg outlier {outlier} raw z={z} should alert"
+            );
             z_rows.push((6, outlier));
             expect_rule(
                 &series_of(MetricKind::ReadinessScore, &z_rows),
