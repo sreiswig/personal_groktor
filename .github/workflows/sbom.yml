@@ -16,6 +16,13 @@ on:
     # Weekly: Monday 09:00 America/Chicago (14:00 UTC while CDT)
     - cron: "0 14 * * 1"
 
+# PR runs share a per-PR group and supersede each other. Every other event
+# (push, release, schedule, workflow_dispatch) gets a unique per-run group,
+# so it can never be cancelled or replaced by a newer pending run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -25,11 +32,11 @@ jobs:
     # Caps hung steps once a runner picks the job up (observed ~1.5 min).
     # Does NOT bound time spent queued waiting for a runner.
     timeout-minutes: 15
-    # contents: write only so release runs can attach the SBOM asset.
-    # PRs/pushes still upload a workflow artifact with the default token.
+    # Least privilege: generate, scan, and upload artifacts only.
+    # Release-asset upload (contents: write) lives in the release-asset job.
     # No security-events: that would be GitHub code scanning (GHAS on private).
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,10 +47,21 @@ jobs:
           path: .
           format: cyclonedx-json
           output-file: sbom.cyclonedx.json
-          upload-artifact: true
-          upload-artifact-retention: "30"
-          upload-release-assets: true
+          # Pinned upload-artifact below owns the workflow artifact (fixed name).
+          # This action must not attach a release asset from a pull request.
+          upload-artifact: false
+          upload-release-assets: false
           dependency-snapshot: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Fixed name, verified from schedule run 40389203649
+          # (personal_groktor-sbom.cyclonedx.json). The zip entry stays
+          # output-file (sbom.cyclonedx.json); release-asset checks that path.
+          name: ${{ github.event.repository.name }}-sbom.cyclonedx.json
+          path: sbom.cyclonedx.json
+          retention-days: 30
 
       - name: Scan CycloneDX SBOM (Grype)
         id: grype
@@ -63,3 +81,32 @@ jobs:
           name: grype-report
           path: grype.json
           retention-days: 30
+
+  release-asset:
+    # Only job with contents: write; runs only for published releases.
+    # Not exercisable on a PR — verified by review.
+    if: github.event_name == 'release'
+    needs: sbom
+    runs-on: ubuntu-24.04
+    # Caps hung steps once a runner picks the job up (new job; expected <1 min).
+    # Does NOT bound time spent queued waiting for a runner.
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ github.event.repository.name }}-sbom.cyclonedx.json
+          path: .
+
+      - name: Upload SBOM to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Passed via env (not inlined) to avoid script injection from tag names.
+          TAG: ${{ github.event.release.tag_name }}
+          # Zip entry is the output file. Check it exists; do not execute it.
+          SBOM: sbom.cyclonedx.json
+        run: |
+          test -f "$SBOM"
+          gh release upload "$TAG" "$SBOM" --clobber --repo "$GITHUB_REPOSITORY"
