@@ -5,8 +5,13 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use crate::error::{GroktorError, Result};
 use crate::schema::{MetricKind, MetricPoint, RawMetricRow};
 
-/// Make an untrusted string safe for a single log line: escape control
-/// characters (\n, \r, \t, ESC, ...) and cap the length.
+/// Make an untrusted string safe for a single log line.
+///
+/// Escapes every C0 control (including `\r`, `\n`, `\t`, and ESC), DEL, and
+/// every C1 control, plus Unicode line and paragraph separators. ANSI CSI /
+/// OSC sequences start with one of those, so the introducer is escaped and
+/// the rest of the sequence cannot retarget the terminal. The result is
+/// capped at 64 input characters.
 pub(crate) fn sanitize_for_log(s: &str) -> String {
     const MAX: usize = 64;
     let mut out = String::with_capacity(s.len().min(MAX) + 8);
@@ -15,13 +20,19 @@ pub(crate) fn sanitize_for_log(s: &str) -> String {
             out.push('\u{2026}');
             break;
         }
-        if c.is_control() {
+        if log_meta_char(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Characters that can forge a second log line or introduce an ANSI sequence.
+fn log_meta_char(c: char) -> bool {
+    // `is_control` is Unicode category Cc: C0 (U+0000..=U+001F), DEL, and C1.
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
 /// Default unit for a metric when the export omits one.
@@ -278,5 +289,61 @@ mod tests {
     #[test]
     fn sanitize_for_log_empty_string() {
         assert_eq!(sanitize_for_log(""), "");
+    }
+
+    #[test]
+    fn sanitize_for_log_escapes_every_c0_del_c1_and_drops_a_control_past_the_cap() {
+        let controls: Vec<char> = (0x00u32..=0x1F)
+            .chain(std::iter::once(0x7F))
+            .chain(0x80..=0x9F)
+            .map(|cp| char::from_u32(cp).expect("scalar"))
+            .collect();
+        for c in &controls {
+            let out = sanitize_for_log(&c.to_string());
+            let cp = u32::from(*c);
+            assert!(
+                !out.chars().any(|ch| ch.is_control()),
+                "U+{cp:04X} still contains a raw control: {out:?}"
+            );
+            assert_ne!(out, c.to_string(), "U+{cp:04X} was not escaped");
+        }
+
+        // A newline just past the cap must be omitted, not appended raw.
+        let mut bounded = "a".repeat(64);
+        bounded.push('\n');
+        let out = sanitize_for_log(&bounded);
+        assert!(!out.contains('\n'), "{out:?}");
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(out.chars().take(64).collect::<String>(), "a".repeat(64));
+    }
+
+    #[test]
+    fn error_messages_escape_c1_ansi_and_unicode_line_separators() {
+        let date = "2026-08-01\u{85}forged\u{2028}line\u{2029}";
+        let date_err = normalize_row(&raw(date, "steps", 1.0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !date_err.chars().any(log_meta_char),
+            "date error still has a meta character: {date_err:?}"
+        );
+        assert!(
+            date_err.contains(r"\u{85}") && date_err.contains(r"\u{2028}"),
+            "C1 NEL and line separator should be escaped: {date_err:?}"
+        );
+
+        // ESC CSI and the 8-bit C1 CSI (U+009B) both introduce ANSI sequences.
+        let metric = "hr\u{1b}[2J\u{9b}31m\u{1b}]0;title\u{7}";
+        let metric_err = normalize_row(&raw("2026-08-01", metric, f64::NAN))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !metric_err.chars().any(log_meta_char),
+            "metric error still has a meta character: {metric_err:?}"
+        );
+        assert!(
+            metric_err.contains(r"\u{1b}[2J") && metric_err.contains(r"\u{9b}31m"),
+            "ANSI introducers should be escaped, not dropped: {metric_err:?}"
+        );
     }
 }
