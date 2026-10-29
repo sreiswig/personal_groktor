@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analyze::{clamp_overflow_quotient, mean, std_dev};
 use crate::error::Result;
+use crate::normalize::metric_value_accepted;
 use crate::schema::{
     Annotation, Arm, Direction, Experiment, ExperimentDay, Finding, LabReport, MetricKind,
     OutcomeResult, OutcomeSpec,
@@ -160,7 +161,15 @@ fn compute_outcome(
     let med_i = median_opt(&iv);
     let med_c = median_opt(&cv);
     let delta = match (mean_i, mean_c) {
-        (Some(a), Some(b)) => Some(a - b),
+        (Some(a), Some(b)) => {
+            let d = a - b;
+            // inf - inf is NaN. Keep a finite or infinite difference; drop NaN.
+            if d.is_nan() {
+                None
+            } else {
+                Some(d)
+            }
+        }
         _ => None,
     };
     let effect_size = if iv.len() >= 5 && cv.len() >= 5 {
@@ -201,7 +210,7 @@ fn empty_outcome(spec: &OutcomeSpec) -> OutcomeResult {
 }
 
 fn median_opt(xs: &[f64]) -> Option<f64> {
-    if xs.is_empty() {
+    if xs.is_empty() || xs.iter().any(|v| !metric_value_accepted(*v)) {
         return None;
     }
     let mut v = xs.to_vec();
@@ -591,6 +600,41 @@ mod tests {
         assert!(result.delta.is_some_and(|v| !v.is_nan()));
         assert!(result.median_intervention.is_some_and(|v| !v.is_nan()));
         assert!(result.median_control.is_some_and(|v| !v.is_nan()));
+        assert!(!result.effect_size.is_some_and(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn non_finite_arm_values_do_not_yield_nan_summaries() {
+        let spec = hrv_up();
+        let iv: BTreeSet<_> = (0..5).map(day).collect();
+        let cv: BTreeSet<_> = (10..15).map(day).collect();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut series = BTreeMap::new();
+            for d in &iv {
+                series.insert(*d, bad);
+            }
+            for d in &cv {
+                series.insert(*d, 40.0);
+            }
+            let result = compute_outcome(&spec, &series, &iv, &cv);
+            assert!(result.mean_intervention.is_none(), "{bad}");
+            assert!(result.median_intervention.is_none(), "{bad}");
+            assert!(result.delta.is_none(), "{bad}");
+            assert!(result.effect_size.is_none(), "{bad}");
+            assert!(result.mean_control.is_some_and(|v| v.is_finite()));
+            assert!(result.median_control.is_some_and(|v| v.is_finite()));
+        }
+
+        // Both arms overflow the mean to +inf, and inf - inf is NaN.
+        let mut overflow = BTreeMap::new();
+        for d in iv.iter().chain(cv.iter()) {
+            overflow.insert(*d, 1e308);
+        }
+        let result = compute_outcome(&spec, &overflow, &iv, &cv);
+        assert!(!result.delta.is_some_and(|v| v.is_nan()));
+        assert!(result.median_intervention.is_some_and(|v| v.is_finite()));
+        assert!(result.median_control.is_some_and(|v| v.is_finite()));
         assert!(!result.effect_size.is_some_and(|v| v.is_nan()));
     }
 

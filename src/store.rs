@@ -982,6 +982,46 @@ mod tests {
     }
 
     #[test]
+    fn same_day_non_finite_does_not_replace_a_finite_value() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 8, 2).unwrap();
+        // Explicit recorded_at so last-value-wins is not an accident of Utc::now().
+        let rows = [
+            ("am-finite", "2026-08-01T08:00:00Z", "2026-08-01", 1000.0),
+            (
+                "pm-inf",
+                "2026-08-01T18:00:00Z",
+                "2026-08-01",
+                f64::INFINITY,
+            ),
+            (
+                "am-ninf",
+                "2026-08-02T08:00:00Z",
+                "2026-08-02",
+                f64::NEG_INFINITY,
+            ),
+            ("pm-finite", "2026-08-02T18:00:00Z", "2026-08-02", 2500.0),
+        ];
+        for (id, recorded, day_s, value) in rows {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO metrics
+                        (id, kind, category, recorded_at, day, value, unit, source, raw_name, notes)
+                     VALUES (?1, 'steps', 'activity', ?2, ?3, ?4, 'count', 'sql', NULL, NULL)",
+                    params![id, recorded, day_s, value],
+                )
+                .unwrap();
+        }
+
+        let series = store.metric_series(&MetricKind::Steps, day, next).unwrap();
+        assert_eq!(series, vec![(day, 1000.0), (next, 2500.0)]);
+        assert!(series.iter().all(|(_, v)| v.is_finite()));
+    }
+
+    #[test]
     fn annotations_and_experiments() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("test.db")).unwrap();
