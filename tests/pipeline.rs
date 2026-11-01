@@ -180,3 +180,63 @@ fn non_finite_csv_rows_are_reported_and_finite_rows_stored() {
     let values: Vec<f64> = stored.iter().map(|p| p.value).collect();
     assert_eq!(values, vec![8000.0, 9100.0]);
 }
+
+#[test]
+fn csv_non_finite_spellings_and_overflow_do_not_reach_store() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("t.db")).unwrap();
+    let mut csv = NamedTempFile::with_suffix(".csv").unwrap();
+    writeln!(
+        csv,
+        "date,metric,value\n\
+         2026-08-01,steps,8000\n\
+         2026-08-01,rhr,+inf\n\
+         2026-08-01,hrv,Infinity\n\
+         2026-08-01,sleep_hours,-Infinity\n\
+         2026-08-01,weight,+Infinity\n\
+         2026-08-02,spo2,1e309\n\
+         2026-08-02,body_fat,-1e309\n\
+         2026-08-03,steps,100"
+    )
+    .unwrap();
+
+    let raw = ingest::load_path(csv.path()).expect("spellings parse as f64");
+    let (points, errors) = normalize::normalize_all(&raw);
+    assert_eq!(points.len(), 2, "{errors:?}");
+    assert!(points.iter().all(|p| p.value.is_finite()));
+    assert_eq!(errors.len(), 6, "{errors:?}");
+    for err in &errors {
+        assert!(
+            err.contains("non-finite"),
+            "expected a clear non-finite error, got {err}"
+        );
+    }
+
+    assert_eq!(store.upsert_metrics(&points).unwrap(), 2);
+    let stored = store.all_metrics().unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|p| p.value.is_finite()));
+}
+
+#[test]
+fn json_non_finite_tokens_are_rejected_and_not_stored() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("t.db")).unwrap();
+    for body in [
+        r#"[{"date":"2026-08-01","metric":"rhr","value":NaN}]"#,
+        r#"[{"date":"2026-08-01","metric":"rhr","value":Infinity}]"#,
+        r#"[{"date":"2026-08-01","metric":"rhr","value":-Infinity}]"#,
+        r#"{"metrics":[{"date":"2026-08-01","metric":"hrv","value":NaN}]}"#,
+        r#"[{"date":"2026-08-01","metric":"steps","value":1e309}]"#,
+        r#"[{"date":"2026-08-01","metric":"steps","value":-1e309}]"#,
+    ] {
+        let mut json = NamedTempFile::with_suffix(".json").unwrap();
+        write!(json, "{body}").unwrap();
+        let err = ingest::load_path(json.path()).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Parse error: JSON must be an array"),
+            "{body} -> {err}"
+        );
+        assert_eq!(store.metric_count().unwrap(), 0);
+    }
+}

@@ -98,17 +98,36 @@ fn parse_timestamp(s: &str, fallback_day: NaiveDate) -> Result<DateTime<Utc>> {
     Ok(Utc.from_utc_datetime(&ndt))
 }
 
+/// Finite metric values are safe to store and to feed into mean / z-score.
+///
+/// CSV parsing accepts `NaN` / `inf` / `-inf` as `f64`. Normalize, direct
+/// inserts, database reads, and the rule engine all use this predicate.
+pub(crate) fn metric_value_accepted(value: f64) -> bool {
+    value.is_finite()
+}
+
+/// Reject `NaN` / `±inf`.
+///
+/// `metric` is interpolated into an error that ingest logs with `{}`.
+/// Callers pass a raw export name (`normalize_row`) or `MetricKind::as_str()`
+/// (`upsert_metrics`, which can be `MetricKind::Other`), so the name is
+/// escaped here and every caller stays safe.
+pub(crate) fn reject_non_finite_metric(value: f64, metric: &str) -> Result<()> {
+    if metric_value_accepted(value) {
+        Ok(())
+    } else {
+        Err(GroktorError::Parse(format!(
+            "non-finite value {value} for metric '{}'",
+            sanitize_for_log(metric)
+        )))
+    }
+}
+
 /// Normalize a single raw row into a metric point.
 pub fn normalize_row(row: &RawMetricRow) -> Result<MetricPoint> {
     // Non-finite values parse as f64 (CSV `NaN` / `inf` / `-inf`) but poison
     // means and make rule comparisons silently false. Reject the row instead.
-    if !row.value.is_finite() {
-        let value = row.value;
-        let metric = sanitize_for_log(&row.metric);
-        return Err(GroktorError::Parse(format!(
-            "non-finite value {value} for metric '{metric}'"
-        )));
-    }
+    reject_non_finite_metric(row.value, row.metric.as_str())?;
 
     let day = parse_day(&row.date)?;
     let recorded_at = match &row.timestamp {
@@ -219,6 +238,22 @@ mod tests {
                 "row 3: Parse error: unrecognized date: not-a-date".to_string(),
                 "row 4: Parse error: non-finite value -inf for metric 'sleep_hours'".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn reject_non_finite_metric_escapes_the_name_for_every_caller() {
+        let err = reject_non_finite_metric(f64::NAN, "rhr\nforged\x1b[2J")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\n'), "error must stay on one line: {err:?}");
+        assert!(
+            !err.contains('\x1b'),
+            "error must not contain a raw ESC: {err:?}"
+        );
+        assert!(
+            err.contains(r"rhr\nforged\u{1b}[2J"),
+            "controls should be escaped, not dropped: {err:?}"
         );
     }
 

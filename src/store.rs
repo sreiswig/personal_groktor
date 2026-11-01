@@ -131,7 +131,13 @@ impl Store {
     // ── Metrics ──────────────────────────────────────────────────────────────
 
     /// Insert metrics; skip duplicates by id. Returns number newly inserted.
+    ///
+    /// Non-finite values are rejected with the same error as `normalize_row`,
+    /// and nothing in the batch is written.
     pub fn upsert_metrics(&self, points: &[MetricPoint]) -> Result<usize> {
+        for p in points {
+            crate::normalize::reject_non_finite_metric(p.value, p.kind.as_str())?;
+        }
         let mut inserted = 0usize;
         let tx = self.conn.unchecked_transaction()?;
         {
@@ -212,7 +218,9 @@ impl Store {
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            if let Some(point) = accept_stored_metric(r?) {
+                out.push(point);
+            }
         }
         Ok(out)
     }
@@ -244,6 +252,14 @@ impl Store {
             let (day_s, value) = r?;
             let day = NaiveDate::parse_from_str(&day_s, "%Y-%m-%d")
                 .map_err(|e| GroktorError::Parse(format!("bad day in db: {e}")))?;
+            if !crate::normalize::metric_value_accepted(value) {
+                tracing::warn!(
+                    metric = kind.as_str(),
+                    value,
+                    "skipping stored non-finite metric"
+                );
+                continue;
+            }
             map.insert(day, value);
         }
         Ok(map.into_iter().collect())
@@ -260,7 +276,9 @@ impl Store {
         let rows = stmt.query_map([], row_to_metric)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            if let Some(point) = accept_stored_metric(r?) {
+                out.push(point);
+            }
         }
         Ok(out)
     }
@@ -632,6 +650,19 @@ impl Store {
     }
 }
 
+fn accept_stored_metric(point: MetricPoint) -> Option<MetricPoint> {
+    if crate::normalize::metric_value_accepted(point.value) {
+        Some(point)
+    } else {
+        tracing::warn!(
+            metric = point.kind.as_str(),
+            value = point.value,
+            "skipping stored non-finite metric"
+        );
+        None
+    }
+}
+
 // ── Row mappers ──────────────────────────────────────────────────────────────
 
 fn parse_day(s: &str) -> Result<NaiveDate> {
@@ -870,6 +901,124 @@ mod tests {
         let got = store.metrics_in_range(day, day).unwrap();
         assert_eq!(got.len(), 1);
         assert!((got[0].value - 9000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn upsert_metrics_rejects_non_finite_values() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let finite = MetricPoint::new(MetricKind::Steps, Utc::now(), day, 1000.0, "count", "test");
+        for (value, shown) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            let bad = MetricPoint::new(MetricKind::Steps, Utc::now(), day, value, "count", "test");
+            let err = store
+                .upsert_metrics(&[finite.clone(), bad])
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("Parse error: non-finite value {shown} for metric 'steps'")
+            );
+            assert_eq!(store.metric_count().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn reads_skip_non_finite_rows_inserted_directly() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let ok = MetricPoint::new(MetricKind::Steps, Utc::now(), day, 1000.0, "count", "test");
+        store.upsert_metrics(std::slice::from_ref(&ok)).unwrap();
+
+        // SQLite stores ±inf as REAL, but converts NaN to NULL. The column is
+        // NOT NULL, so a direct NaN insert never lands.
+        let nan_err = store
+            .conn
+            .execute(
+                "INSERT INTO metrics
+                    (id, kind, category, recorded_at, day, value, unit, source)
+                 VALUES ('nan', 'steps', 'activity', '2026-08-02T12:00:00Z', '2026-08-02', ?1, 'count', 'sql')",
+                [f64::NAN],
+            )
+            .unwrap_err();
+        assert!(
+            nan_err.to_string().contains("NOT NULL"),
+            "expected SQLite to reject NaN, got {nan_err}"
+        );
+
+        for (i, value) in [f64::INFINITY, f64::NEG_INFINITY].into_iter().enumerate() {
+            let id = format!("inf-{i}");
+            let bad_day = (day + chrono::Duration::days(1 + i as i64)).to_string();
+            let recorded = format!("2026-08-0{}T12:00:00Z", 2 + i);
+            store
+                .conn
+                .execute(
+                    "INSERT INTO metrics
+                        (id, kind, category, recorded_at, day, value, unit, source, raw_name, notes)
+                     VALUES (?1, 'steps', 'activity', ?2, ?3, ?4, 'count', 'sql', NULL, NULL)",
+                    params![id, recorded, bad_day, value],
+                )
+                .unwrap();
+        }
+
+        let end = day + chrono::Duration::days(2);
+        let got = store.metrics_in_range(day, end).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].value, 1000.0);
+        assert!(got.iter().all(|p| p.value.is_finite()));
+
+        let all = store.all_metrics().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all.iter().all(|p| p.value.is_finite()));
+
+        let series = store.metric_series(&MetricKind::Steps, day, end).unwrap();
+        assert_eq!(series, vec![(day, 1000.0)]);
+        assert!(series.iter().all(|(_, v)| v.is_finite()));
+    }
+
+    #[test]
+    fn same_day_non_finite_does_not_replace_a_finite_value() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 8, 2).unwrap();
+        // Explicit recorded_at so last-value-wins is not an accident of Utc::now().
+        let rows = [
+            ("am-finite", "2026-08-01T08:00:00Z", "2026-08-01", 1000.0),
+            (
+                "pm-inf",
+                "2026-08-01T18:00:00Z",
+                "2026-08-01",
+                f64::INFINITY,
+            ),
+            (
+                "am-ninf",
+                "2026-08-02T08:00:00Z",
+                "2026-08-02",
+                f64::NEG_INFINITY,
+            ),
+            ("pm-finite", "2026-08-02T18:00:00Z", "2026-08-02", 2500.0),
+        ];
+        for (id, recorded, day_s, value) in rows {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO metrics
+                        (id, kind, category, recorded_at, day, value, unit, source, raw_name, notes)
+                     VALUES (?1, 'steps', 'activity', ?2, ?3, ?4, 'count', 'sql', NULL, NULL)",
+                    params![id, recorded, day_s, value],
+                )
+                .unwrap();
+        }
+
+        let series = store.metric_series(&MetricKind::Steps, day, next).unwrap();
+        assert_eq!(series, vec![(day, 1000.0), (next, 2500.0)]);
+        assert!(series.iter().all(|(_, v)| v.is_finite()));
     }
 
     #[test]

@@ -13,19 +13,40 @@ const Z_THRESHOLD: f64 = 2.0;
 type Series = BTreeMap<MetricKind, BTreeMap<NaiveDate, f64>>;
 
 pub fn run_rules(series: &Series) -> Vec<Finding> {
+    let series = finite_series(series);
     let mut findings = Vec::new();
 
-    for (kind, by_day) in series {
+    for (kind, by_day) in &series {
         findings.extend(zscore_outliers(kind, by_day));
     }
 
-    findings.extend(sleep_debt(series));
-    findings.extend(rhr_up_after_poor_sleep(series));
-    findings.extend(activity_dropoff(series));
-    findings.extend(hrv_drop(series));
+    findings.extend(sleep_debt(&series));
+    findings.extend(rhr_up_after_poor_sleep(&series));
+    findings.extend(activity_dropoff(&series));
+    findings.extend(hrv_drop(&series));
 
     findings.sort_by(|a, b| a.day.cmp(&b.day).then(a.title.cmp(&b.title)));
     findings
+}
+
+/// Drop NaN / ±inf before comparisons. `-inf < threshold` is true, so a
+/// non-finite sample would otherwise become a real alert.
+fn finite_series(series: &Series) -> Series {
+    series
+        .iter()
+        .filter_map(|(kind, by_day)| {
+            let by_day: BTreeMap<NaiveDate, f64> = by_day
+                .iter()
+                .filter(|(_, value)| crate::normalize::metric_value_accepted(**value))
+                .map(|(day, value)| (*day, *value))
+                .collect();
+            if by_day.is_empty() {
+                None
+            } else {
+                Some((kind.clone(), by_day))
+            }
+        })
+        .collect()
 }
 
 fn baseline_before(by_day: &BTreeMap<NaiveDate, f64>, day: NaiveDate) -> Vec<f64> {
@@ -254,6 +275,7 @@ fn hrv_drop(series: &Series) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::stats::std_dev;
     use super::*;
     use chrono::NaiveDate;
 
@@ -284,5 +306,413 @@ mod tests {
         series.insert(MetricKind::HeartRateVariabilityMs, hrv);
         let findings = run_rules(&series);
         assert!(findings.iter().any(|f| f.rule_id == "hrv_drop"));
+    }
+
+    #[test]
+    fn overflowed_z_score_still_alerts_elevated_on_day_6() {
+        // sd of 60, 61, 60, 61, 60 is about 0.548, so (1e308 - mean) / sd
+        // overflows to +inf. Main returned Some(inf) and flagged day 6.
+        let mut rhr = BTreeMap::new();
+        for (i, value) in [60.0, 61.0, 60.0, 61.0, 60.0].into_iter().enumerate() {
+            rhr.insert(d((i + 1) as u32), value);
+        }
+        rhr.insert(d(6), 1e308);
+        let mut series = BTreeMap::new();
+        series.insert(MetricKind::RestingHeartRateBpm, rhr);
+        let findings = run_rules(&series);
+        let alerts: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "zscore_outlier")
+            .collect();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "rules: {:?}",
+            findings
+                .iter()
+                .map(|f| (&f.day, f.rule_id.as_str(), f.title.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(alerts[0].day, d(6));
+        assert!(
+            alerts[0].title.contains("elevated"),
+            "title {}",
+            alerts[0].title
+        );
+        assert_eq!(alerts[0].value, Some(1e308));
+    }
+
+    #[test]
+    fn non_finite_samples_do_not_alert_and_do_not_hide_a_finite_drop() {
+        let mut hrv = BTreeMap::new();
+        for day in 1..=7 {
+            hrv.insert(d(day), 50.0);
+        }
+        // `-inf < 0.8 * baseline` is true, so this used to alert on its own
+        // and poison the next day's mean (`m <= 0` then skips a real drop).
+        hrv.insert(d(8), f64::NEG_INFINITY);
+        hrv.insert(d(9), f64::NAN);
+        hrv.insert(d(10), f64::INFINITY);
+        hrv.insert(d(11), 10.0);
+        let mut series = BTreeMap::new();
+        series.insert(MetricKind::HeartRateVariabilityMs, hrv);
+        let findings = run_rules(&series);
+        let drops: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "hrv_drop")
+            .collect();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].day, d(11));
+        assert_eq!(drops[0].value, Some(10.0));
+        assert!(findings.iter().all(|f| {
+            f.value
+                .into_iter()
+                .chain(f.baseline)
+                .all(|v| !v.is_nan() && v.is_finite())
+        }));
+    }
+
+    /// Deterministic stand-in for proptest/quickcheck (neither is a dev-dependency).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((self.0 >> 11) as f64) / ((1_u64 << 53) as f64)
+        }
+    }
+
+    fn day_from(offset: i64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(offset)
+    }
+
+    fn series_of(kind: MetricKind, values: &[(i64, f64)]) -> Series {
+        let mut by_day = BTreeMap::new();
+        for (offset, value) in values {
+            by_day.insert(day_from(*offset), *value);
+        }
+        let mut series = Series::new();
+        series.insert(kind, by_day);
+        series
+    }
+
+    fn assert_no_nan(findings: &[Finding]) {
+        for f in findings {
+            if let Some(v) = f.value {
+                assert!(!v.is_nan(), "{} value is NaN", f.rule_id);
+            }
+            if let Some(b) = f.baseline {
+                assert!(!b.is_nan(), "{} baseline is NaN", f.rule_id);
+            }
+        }
+    }
+
+    fn expect_rule(series: &Series, rule_id: &str, day: NaiveDate) {
+        let findings = run_rules(series);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == rule_id && f.day == day),
+            "missing {rule_id} on {day}; got {:?}",
+            findings
+                .iter()
+                .map(|f| (f.day, f.rule_id.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_no_nan(&findings);
+    }
+
+    fn oracle_mean(values: &[f64]) -> Option<f64> {
+        if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+
+    /// Raw `(value - mean) / sd`. An infinite quotient stays ±inf.
+    ///
+    /// `None` only when there is no usable sd: too few points, a non-finite
+    /// input, a non-finite sd, or sd below `1e-9`. That is the pre-existing
+    /// zero-spread guard, not "a non-finite quotient means no alert".
+    fn raw_z(value: f64, baseline: &[f64]) -> Option<f64> {
+        if baseline.len() < 2 || !value.is_finite() || baseline.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let n = baseline.len() as f64;
+        let m = baseline.iter().sum::<f64>() / n;
+        if !m.is_finite() {
+            return None;
+        }
+        let var = baseline.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (n - 1.0);
+        let s = var.sqrt();
+        if !s.is_finite() || s < 1e-9 {
+            return None;
+        }
+        Some((value - m) / s)
+    }
+
+    /// Whether the outlier rule should fire, from the raw quotient.
+    ///
+    /// ±inf alerts (`|inf| >= 2` in the rule). A NaN quotient does not.
+    /// This does not treat every non-finite quotient as "no score".
+    fn z_outlier_expected(value: f64, baseline: &[f64]) -> bool {
+        baseline.len() >= 5
+            && matches!(
+                raw_z(value, baseline),
+                Some(z) if z.is_infinite() || z.abs() >= 2.0
+            )
+    }
+
+    fn assert_z_alert(baseline: &[f64], value: f64) {
+        let z = raw_z(value, baseline).unwrap_or_else(|| {
+            panic!("no raw z for {value} against {baseline:?}");
+        });
+        assert!(
+            z_outlier_expected(value, baseline),
+            "raw z={z} for {value} should alert"
+        );
+        let mut rows: Vec<(i64, f64)> = baseline
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as i64, *v))
+            .collect();
+        let day = rows.len() as i64;
+        rows.push((day, value));
+        expect_rule(
+            &series_of(MetricKind::RestingHeartRateBpm, &rows),
+            "zscore_outlier",
+            day_from(day),
+        );
+        let got = z_score(value, baseline).unwrap_or_else(|| {
+            panic!("z_score dropped outlier {value} (raw z={z})");
+        });
+        assert!(!got.is_nan());
+        if z.is_infinite() {
+            assert_eq!(got, z.signum() * f64::MAX);
+        } else {
+            assert!((got - z).abs() <= 1e-6 * z.abs().max(1.0));
+        }
+    }
+
+    fn should_hrv_drop(baseline: &[f64], value: f64) -> bool {
+        if baseline.len() < 7 || !value.is_finite() {
+            return false;
+        }
+        matches!(oracle_mean(baseline), Some(m) if m > 0.0 && value < m * 0.8)
+    }
+
+    fn should_activity_drop(baseline: &[f64], value: f64) -> bool {
+        if baseline.len() < 7 || !value.is_finite() {
+            return false;
+        }
+        matches!(
+            oracle_mean(baseline),
+            Some(m) if m >= 3000.0 && value < m * 0.5
+        )
+    }
+
+    fn should_sleep_debt(values: &[f64]) -> bool {
+        values.len() >= 3 && values.iter().all(|v| v.is_finite() && *v < 6.5)
+    }
+
+    fn fill_constant(n: usize, value: f64) -> Vec<(i64, f64)> {
+        (0..n).map(|i| (i as i64, value)).collect()
+    }
+
+    #[test]
+    fn finite_inputs_never_silently_drop_an_alert() {
+        let extremes = [
+            0.0,
+            -0.0,
+            1e308,
+            -1e308,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+        ];
+
+        // Z-score: modest spread so every extreme is a real outlier.
+        // sd here is about 1.87, so 1e308 / sd stays finite.
+        let z_base = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+        for value in extremes {
+            assert_z_alert(&z_base, value);
+        }
+
+        // Tiny but usable sd: ( ±1e308 - mean ) / sd overflows to ±inf.
+        // The repro baseline has sd ≈ 0.548. The 1e-8 spike has sd ≈ 4.5e-9,
+        // just above the 1e-9 floor.
+        let overflow_bases = [
+            vec![60.0, 61.0, 60.0, 61.0, 60.0],
+            vec![0.0, 0.0, 0.0, 0.0, 1e-8],
+        ];
+        for base in &overflow_bases {
+            for value in [1e308, -1e308] {
+                let z = raw_z(value, base).unwrap_or_else(|| {
+                    panic!("expected a quotient for {value} vs {base:?}");
+                });
+                assert!(
+                    z.is_infinite(),
+                    "baseline {base:?} value {value} should overflow, z={z}"
+                );
+                assert_z_alert(base, value);
+            }
+        }
+        let mut tiny = Lcg(0x71_7E_5D_u64);
+        for _ in 0..12 {
+            let delta = 1e-6 * (1.0 + tiny.next_unit() * 1e3);
+            let base = [0.0, 0.0, 0.0, 0.0, delta];
+            for value in [1e308, -1e308] {
+                let z = raw_z(value, &base).unwrap_or_else(|| {
+                    panic!("expected a quotient for delta {delta}");
+                });
+                assert!(
+                    z.is_infinite(),
+                    "delta {delta} value {value} should overflow, z={z}"
+                );
+                assert_z_alert(&base, value);
+            }
+        }
+
+        // HRV drop, including a subnormal baseline and an overflowing 1e308 baseline.
+        for level in [50.0, 1.0, f64::MIN_POSITIVE, 1e308] {
+            let baseline = vec![level; 7];
+            for value in [0.0, -1e308, f64::MIN_POSITIVE, level * 0.5, 1e308] {
+                if !should_hrv_drop(&baseline, value) {
+                    continue;
+                }
+                let mut rows = fill_constant(7, level);
+                rows.push((7, value));
+                expect_rule(
+                    &series_of(MetricKind::HeartRateVariabilityMs, &rows),
+                    "hrv_drop",
+                    day_from(7),
+                );
+            }
+        }
+
+        // Activity drop-off.
+        for level in [8000.0, 3000.0, 1e308] {
+            let baseline = vec![level; 7];
+            for value in [0.0, f64::MIN_POSITIVE, -1e308, f64::MIN, level * 0.49] {
+                if !should_activity_drop(&baseline, value) {
+                    continue;
+                }
+                let mut rows = fill_constant(7, level);
+                rows.push((7, value));
+                expect_rule(
+                    &series_of(MetricKind::Steps, &rows),
+                    "activity_dropoff",
+                    day_from(7),
+                );
+            }
+        }
+
+        // Three short-sleep days, including extremes below 6.5h.
+        let short = [
+            0.0,
+            -0.0,
+            6.49,
+            5.5,
+            1e-10,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            -1e308,
+            f64::MIN,
+        ];
+        for value in short {
+            let vals = [value, value, value];
+            assert!(
+                should_sleep_debt(&vals),
+                "{value} should count as short sleep"
+            );
+            let rows = fill_constant(3, value);
+            expect_rule(
+                &series_of(MetricKind::SleepDurationHours, &rows),
+                "sleep_debt_3d",
+                day_from(2),
+            );
+        }
+
+        let mut lcg = Lcg(0xC0FFEE_u64);
+        for trial in 0..24 {
+            let mut z_rows = vec![(0_i64, 40.0), (1, 60.0)];
+            for i in 2..6 {
+                z_rows.push((i, 40.0 + lcg.next_unit() * 20.0));
+            }
+            let base: Vec<f64> = z_rows.iter().map(|(_, v)| *v).collect();
+            let outlier = -50.0 - lcg.next_unit() * 100.0;
+            let z = raw_z(outlier, &base).expect("lcg baseline should produce a quotient");
+            assert!(
+                z_outlier_expected(outlier, &base),
+                "lcg outlier {outlier} raw z={z} should alert"
+            );
+            z_rows.push((6, outlier));
+            expect_rule(
+                &series_of(MetricKind::ReadinessScore, &z_rows),
+                "zscore_outlier",
+                day_from(6),
+            );
+
+            let level = 1.0 + lcg.next_unit() * 80.0;
+            let low = level * 0.5;
+            assert!(should_hrv_drop(&[level; 7], low));
+            let mut hrv = fill_constant(7, level);
+            hrv.push((7, low));
+            expect_rule(
+                &series_of(MetricKind::HeartRateVariabilityMs, &hrv),
+                "hrv_drop",
+                day_from(7),
+            );
+
+            let steps_level = 3000.0 + lcg.next_unit() * 12_000.0;
+            assert!(should_activity_drop(&[steps_level; 7], 0.0));
+            let mut steps = fill_constant(7, steps_level);
+            steps.push((7, 0.0));
+            expect_rule(
+                &series_of(MetricKind::Steps, &steps),
+                "activity_dropoff",
+                day_from(7),
+            );
+
+            let a = lcg.next_unit() * 6.4;
+            let b = -lcg.next_unit() * 4.0;
+            let c = lcg.next_unit() * 5.0;
+            assert!(should_sleep_debt(&[a, b, c]));
+            let origin = trial as i64;
+            expect_rule(
+                &series_of(
+                    MetricKind::SleepDurationHours,
+                    &[(origin, a), (origin + 1, b), (origin + 2, c)],
+                ),
+                "sleep_debt_3d",
+                day_from(origin + 2),
+            );
+        }
+
+        // Analytics on finite inputs, including the extremes above, never return NaN.
+        let mut corpus = extremes.to_vec();
+        corpus.extend([1.0, -1.0, 5.0, 6.49, 40.0, 50.0, 8000.0, 3000.0]);
+        let mut sweep = Lcg(0xA11C_E5EED);
+        for _ in 0..48 {
+            let u = sweep.next_unit();
+            corpus.push(u);
+            corpus.push(u * 100.0 - 50.0);
+            corpus.push((u - 0.5) * 2.0 * 1e308);
+        }
+        assert!(corpus.iter().all(|v| v.is_finite()));
+        for window in corpus.windows(8) {
+            if let Some(m) = mean(window) {
+                assert!(!m.is_nan(), "mean NaN for {window:?}");
+            }
+            if let Some(s) = std_dev(window) {
+                assert!(!s.is_nan(), "std_dev NaN for {window:?}");
+            }
+            for &value in &corpus {
+                if let Some(z) = z_score(value, window) {
+                    assert!(!z.is_nan(), "z_score NaN for {value} vs {window:?}");
+                }
+            }
+        }
     }
 }

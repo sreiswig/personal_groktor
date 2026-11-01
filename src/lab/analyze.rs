@@ -6,8 +6,9 @@
 use chrono::{NaiveDate, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::analyze::{mean, std_dev};
+use crate::analyze::{clamp_overflow_quotient, mean, std_dev};
 use crate::error::Result;
+use crate::normalize::metric_value_accepted;
 use crate::schema::{
     Annotation, Arm, Direction, Experiment, ExperimentDay, Finding, LabReport, MetricKind,
     OutcomeResult, OutcomeSpec,
@@ -160,7 +161,15 @@ fn compute_outcome(
     let med_i = median_opt(&iv);
     let med_c = median_opt(&cv);
     let delta = match (mean_i, mean_c) {
-        (Some(a), Some(b)) => Some(a - b),
+        (Some(a), Some(b)) => {
+            let d = a - b;
+            // inf - inf is NaN. Keep a finite or infinite difference; drop NaN.
+            if d.is_nan() {
+                None
+            } else {
+                Some(d)
+            }
+        }
         _ => None,
     };
     let effect_size = if iv.len() >= 5 && cv.len() >= 5 {
@@ -201,7 +210,7 @@ fn empty_outcome(spec: &OutcomeSpec) -> OutcomeResult {
 }
 
 fn median_opt(xs: &[f64]) -> Option<f64> {
-    if xs.is_empty() {
+    if xs.is_empty() || xs.iter().any(|v| !metric_value_accepted(*v)) {
         return None;
     }
     let mut v = xs.to_vec();
@@ -223,10 +232,11 @@ fn cohens_d(a: &[f64], b: &[f64]) -> Option<f64> {
     let na = a.len() as f64;
     let nb = b.len() as f64;
     let pooled = (((na - 1.0) * sa * sa + (nb - 1.0) * sb * sb) / (na + nb - 2.0)).sqrt();
-    if pooled < 1e-12 {
+    if !pooled.is_finite() || pooled < 1e-12 {
         return None;
     }
-    Some((ma - mb) / pooled)
+    // Same quotient policy as `z_score`: NaN is absent, ±inf clamps to ±f64::MAX.
+    clamp_overflow_quotient((ma - mb) / pooled)
 }
 
 fn detect_confounds(
@@ -570,6 +580,92 @@ mod tests {
         let flat_result = compute_outcome(&spec, &flat, &iv, &cv);
         assert!((flat_result.delta.unwrap() - (10.0 - 30.0)).abs() < 1e-9);
         assert!(flat_result.effect_size.is_none());
+    }
+
+    #[test]
+    fn huge_finite_samples_do_not_yield_nan_effect_size() {
+        let spec = hrv_up();
+        let mut series = BTreeMap::new();
+        let iv: BTreeSet<_> = (0..5).map(day).collect();
+        let cv: BTreeSet<_> = (10..15).map(day).collect();
+        for d in &iv {
+            series.insert(*d, 1e308);
+        }
+        for d in &cv {
+            series.insert(*d, -1e308);
+        }
+        let result = compute_outcome(&spec, &series, &iv, &cv);
+        assert!(result.mean_intervention.is_some_and(|v| !v.is_nan()));
+        assert!(result.mean_control.is_some_and(|v| !v.is_nan()));
+        assert!(result.delta.is_some_and(|v| !v.is_nan()));
+        assert!(result.median_intervention.is_some_and(|v| !v.is_nan()));
+        assert!(result.median_control.is_some_and(|v| !v.is_nan()));
+        assert!(!result.effect_size.is_some_and(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn non_finite_arm_values_do_not_yield_nan_summaries() {
+        let spec = hrv_up();
+        let iv: BTreeSet<_> = (0..5).map(day).collect();
+        let cv: BTreeSet<_> = (10..15).map(day).collect();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut series = BTreeMap::new();
+            for d in &iv {
+                series.insert(*d, bad);
+            }
+            for d in &cv {
+                series.insert(*d, 40.0);
+            }
+            let result = compute_outcome(&spec, &series, &iv, &cv);
+            assert!(result.mean_intervention.is_none(), "{bad}");
+            assert!(result.median_intervention.is_none(), "{bad}");
+            assert!(result.delta.is_none(), "{bad}");
+            assert!(result.effect_size.is_none(), "{bad}");
+            assert!(result.mean_control.is_some_and(|v| v.is_finite()));
+            assert!(result.median_control.is_some_and(|v| v.is_finite()));
+        }
+
+        // Both arms overflow the mean to +inf, and inf - inf is NaN.
+        let mut overflow = BTreeMap::new();
+        for d in iv.iter().chain(cv.iter()) {
+            overflow.insert(*d, 1e308);
+        }
+        let result = compute_outcome(&spec, &overflow, &iv, &cv);
+        assert!(!result.delta.is_some_and(|v| v.is_nan()));
+        assert!(result.median_intervention.is_some_and(|v| v.is_finite()));
+        assert!(result.median_control.is_some_and(|v| v.is_finite()));
+        assert!(!result.effect_size.is_some_and(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn cohens_d_clamps_overflowed_quotient() {
+        // Means stay finite (5 * 1e303). Control spread keeps pooled sd finite
+        // and above 1e-12, but |mean difference| / sd overflows to ±inf.
+        let spec = hrv_up();
+        let iv: BTreeSet<_> = (0..5).map(day).collect();
+        let cv: BTreeSet<_> = (10..15).map(day).collect();
+        let control = [0.0, 0.0, 0.0, 0.0, 1e-6];
+
+        let mut positive = BTreeMap::new();
+        for d in &iv {
+            positive.insert(*d, 1e303);
+        }
+        for (d, value) in cv.iter().zip(control) {
+            positive.insert(*d, value);
+        }
+        let up = compute_outcome(&spec, &positive, &iv, &cv);
+        assert_eq!(up.effect_size, Some(f64::MAX));
+
+        let mut negative = BTreeMap::new();
+        for d in &iv {
+            negative.insert(*d, -1e303);
+        }
+        for (d, value) in cv.iter().zip(control) {
+            negative.insert(*d, value);
+        }
+        let down = compute_outcome(&spec, &negative, &iv, &cv);
+        assert_eq!(down.effect_size, Some(-f64::MAX));
     }
 
     #[test]
