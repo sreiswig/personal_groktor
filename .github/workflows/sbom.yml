@@ -82,11 +82,32 @@ jobs:
           path: grype.json
           retention-days: 30
 
+  verify-artifact:
+    # Same download-artifact pin, name, and path as release-asset.
+    # Runs on every event so the unpack contract is exercised without publishing.
+    needs: sbom
+    runs-on: ubuntu-24.04
+    # Caps hung steps once a runner picks the job up.
+    # Does NOT bound time spent queued waiting for a runner.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ github.event.repository.name }}-sbom.cyclonedx.json
+          path: .
+
+      - name: Verify downloaded SBOM
+        run: |
+          test -f WRONG.cyclonedx.json
+
   release-asset:
     # Only job with contents: write; runs only for published releases.
-    # Not exercisable on a PR — verified by review.
+    # Download path (artifact name -> ./sbom.cyclonedx.json) is exercised by verify-artifact, including on PRs.
     if: github.event_name == 'release'
-    needs: sbom
+    needs: [sbom, verify-artifact]
     runs-on: ubuntu-24.04
     # Caps hung steps once a runner picks the job up (new job; expected <1 min).
     # Does NOT bound time spent queued waiting for a runner.
