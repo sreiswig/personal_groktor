@@ -101,7 +101,14 @@ jobs:
 
       - name: Verify downloaded SBOM
         run: |
-          test -f WRONG.cyclonedx.json
+          test -f sbom.cyclonedx.json
+          python3 - <<'PY'
+          import json
+          with open("sbom.cyclonedx.json") as f:
+              doc = json.load(f)
+          assert doc.get("bomFormat") == "CycloneDX", doc.get("bomFormat")
+          print("ok: sbom.cyclonedx.json is CycloneDX")
+          PY
 
   release-asset:
     # Only job with contents: write; runs only for published releases.
