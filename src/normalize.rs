@@ -79,10 +79,12 @@ fn parse_timestamp(s: &str, fallback_day: NaiveDate) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+    // `%.f` is optional and keeps a fractional second (`.123` is 123 ms).
+    // `.%f` is a nanosecond field and would turn `.123` into 123 ns.
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
         return Ok(Utc.from_utc_datetime(&dt));
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return Ok(Utc.from_utc_datetime(&dt));
     }
     // Date-only → noon UTC for stable ordering
