@@ -10,6 +10,7 @@ use personal_groktor::ingest;
 use personal_groktor::lab;
 use personal_groktor::llm::{ChatClient, LlmBackend};
 use personal_groktor::normalize;
+use personal_groktor::private_fs;
 use personal_groktor::report;
 use personal_groktor::schema::{Annotation, Arm, ExperimentStatus};
 use personal_groktor::store::Store;
@@ -386,10 +387,7 @@ async fn cmd_brief(
     store.upsert_digest(&digest)?;
     let text = report::format_digest(&digest);
     if let Some(path) = out {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, &text)?;
+        private_fs::write_private(&path, &text)?;
         println!("Wrote brief to {}", path.display());
     }
     print!("{text}");
@@ -620,10 +618,7 @@ fn cmd_lab(db: Option<PathBuf>, action: LabCmd) -> personal_groktor::Result<()> 
             let report = lab::build_lab_report(&store, &slug)?;
             let text = report::format_lab_report(&report);
             if let Some(path) = out {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, &text)?;
+                private_fs::write_private(&path, &text)?;
                 println!("Wrote lab report to {}", path.display());
             }
             print!("{text}");

@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod lab;
 pub mod llm;
 pub mod normalize;
+pub mod private_fs;
 pub mod report;
 pub mod schema;
 pub mod store;

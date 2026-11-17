@@ -159,6 +159,96 @@ fn endpoint_for_error(url: &reqwest::Url) -> String {
     }
 }
 
+/// `--llm-backend local` must stay on this box or a private network: loopback,
+/// RFC 1918, Tailscale CGNAT (100.64.0.0/10), link-local, IPv6 ULA
+/// (fc00::/7, which covers Tailscale's fd7a:115c:a1e0::/48), or a LAN-style
+/// host name (`localhost`, a single label such as `spark`, or `.local`,
+/// `.lan`, `.home.arpa`, `.internal`, `.ts.net`). Anything else, such as
+/// `https://api.openai.com/v1` or a public IP, is refused, because health
+/// metrics in the prompt would leave the network while the digest still says
+/// `local`. Use `--llm-backend grok` for a remote provider.
+fn ensure_local_base_url(base_url: &str) -> Result<()> {
+    let url = match reqwest::Url::parse(base_url) {
+        Ok(url) => url,
+        Err(_) => return Err(local_base_url_rejected(None)),
+    };
+    if local_parsed_url_allowed(&url) {
+        Ok(())
+    } else {
+        Err(local_base_url_rejected(Some(&url)))
+    }
+}
+
+fn local_parsed_url_allowed(url: &reqwest::Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if url.host().is_none() {
+        return false;
+    }
+    if let Some(domain) = url.domain() {
+        return domain_is_local_name(domain);
+    }
+    let rendered = url.host_str().unwrap_or("");
+    let text = rendered
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(rendered);
+    matches!(text.parse::<IpAddr>(), Ok(ip) if ip_is_loopback_or_private(ip))
+}
+
+fn ip_is_loopback_or_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64.0.0/10: carrier-grade NAT, used for Tailscale addresses.
+                || (a == 100 && (b & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                // fc00::/7 unique local (Tailscale uses fd7a:115c:a1e0::/48).
+                || (first & 0xfe00) == 0xfc00
+                // fe80::/10 link-local.
+                || (first & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| ip_is_loopback_or_private(IpAddr::V4(v4)))
+        }
+    }
+}
+
+fn domain_is_local_name(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() {
+        return false;
+    }
+    if d == "localhost" || d.ends_with(".localhost") || !d.contains('.') {
+        return true;
+    }
+    const LAN_SUFFIXES: [&str; 5] = [".local", ".lan", ".home.arpa", ".internal", ".ts.net"];
+    LAN_SUFFIXES.iter().any(|suffix| d.ends_with(suffix))
+}
+
+fn local_base_url_rejected(parsed: Option<&reqwest::Url>) -> GroktorError {
+    let refusal = match parsed.map(endpoint_for_error) {
+        Some(endpoint) => format!(" Refusing `{endpoint}`."),
+        None => String::new(),
+    };
+    GroktorError::Config(format!(
+        "--llm-backend local only talks to this machine or a private network \
+         (loopback, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, localhost, \
+         a single-label host, or .local/.lan/.home.arpa/.internal/.ts.net), with \
+         no username or password. Use --llm-backend grok for a remote provider.{refusal}"
+    ))
+}
+
 /// Local OpenAI-compatible env: base + model required; key defaults to `local`.
 pub fn resolve_local_config(
     base_url: Option<String>,
@@ -172,6 +262,7 @@ pub fn resolve_local_config(
                 .into(),
         )
     })?;
+    ensure_local_base_url(&base_url)?;
     let model = nonempty(model).ok_or_else(|| {
         GroktorError::Config("--llm-backend local requires GROKTOR_LLM_MODEL or LLM_MODEL.".into())
     })?;
@@ -246,15 +337,21 @@ impl ChatClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model,
             backend,
-            http: Self::build_http_client(),
+            http: Self::build_http_client(backend),
         }
     }
 
-    fn build_http_client() -> reqwest::Client {
-        reqwest::Client::builder()
+    fn build_http_client(backend: LlmBackend) -> reqwest::Client {
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        if backend == LlmBackend::Local {
+            // reqwest honours HTTP_PROXY / HTTPS_PROXY / ALL_PROXY by default,
+            // which would route a "local" prompt through a remote proxy.
+            builder = builder.no_proxy();
+        }
+        builder
             .build()
             .expect("HTTP client with fixed connect and request timeouts")
     }
@@ -305,17 +402,24 @@ impl ChatClient {
         let status = resp.status();
         let text = resp.text().await?;
         let label = self.backend.api_label();
+        // Response bodies can echo the prompt (health metrics), so errors carry
+        // only the status, the body length, and where JSON parsing stopped.
+        // `main` logs these with `tracing::warn!`.
         if !status.is_success() {
             return Err(GroktorError::Llm(format!(
-                "{label} {status}: {}",
-                truncate(&text, 400)
+                "{label} {status} ({} byte body not shown)",
+                text.len()
             )));
         }
 
         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
             GroktorError::Llm(format!(
-                "failed to parse {label} response: {e}; body={}",
-                truncate(&text, 200)
+                "failed to parse {label} response ({:?} error at line {} column {}; \
+                 {} byte body not shown)",
+                e.classify(),
+                e.line(),
+                e.column(),
+                text.len()
             ))
         })?;
 
@@ -352,6 +456,7 @@ struct Choice {
     message: ChatMessage,
 }
 
+#[cfg(test)]
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -556,6 +661,119 @@ mod tests {
         assert!(ok("http://localhost:8080/v1/"));
         let c = ChatClient::new("k", "http://localhost:8080/v1///", "m");
         assert_eq!(c.base_url(), "http://localhost:8080/v1");
+    }
+
+    #[test]
+    fn local_backend_refuses_public_hosts_and_userinfo() {
+        for base in [
+            "https://api.openai.com/v1",
+            "https://api.x.ai/v1",
+            "http://8.8.8.8:8000/v1",
+            "http://100.128.0.1:8000/v1",
+            "http://172.32.0.1:8000/v1",
+            "http://[2001:4860:4860::8888]:8000/v1",
+            "http://[::ffff:8.8.8.8]/v1",
+            "http://localhost.evil.com/v1",
+            "http://127.0.0.1.nip.io/v1",
+            "http://user:pw@127.0.0.1:8000/v1",
+            "http://localhost@evil.example/v1",
+            "ftp://127.0.0.1/v1",
+            "not a url",
+        ] {
+            let err = resolve_local_config(Some(base.into()), Some("m".into()), None).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--llm-backend local only talks to"),
+                "{base}: {msg}"
+            );
+            assert!(!msg.contains("pw"), "{base}: {msg}");
+        }
+    }
+
+    #[test]
+    fn local_backend_allows_lan_names_tailscale_v6_and_https_private() {
+        for base in [
+            "http://localhost:11434/v1",
+            "http://spark:8000/v1",
+            "http://aiserver.tail1234.ts.net:8000/v1",
+            "http://nas.local:8000/v1",
+            "http://gpu.home.arpa/v1",
+            "https://172.16.4.2/v1",
+            "http://169.254.10.10:8000/v1",
+            "http://[fd7a:115c:a1e0::1]:8000/v1",
+            "http://[::ffff:127.0.0.1]:8000/v1",
+        ] {
+            let cfg = resolve_local_config(Some(base.into()), Some("m".into()), None).unwrap();
+            assert_eq!(cfg.base_url, base);
+        }
+    }
+
+    /// One-shot HTTP server on 127.0.0.1 that answers 500 with `body`.
+    fn serve_once(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn local_backend_ignores_proxy_env_and_errors_hide_response_body() {
+        // A proxy on a closed port: if the local client honoured it, the call
+        // would fail to connect instead of reaching the loopback server.
+        for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::set_var(key, "http://127.0.0.1:9");
+        }
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+        let (base, server) = serve_once("echo: resting_hr = 52.00 bpm (source: watch)");
+        let cfg = resolve_local_config(Some(base), Some("m".into()), None).unwrap();
+        let client = ChatClient::from_config(cfg, LlmBackend::Local);
+        let err = client
+            .complete_raw("resting_hr = 52.00 bpm")
+            .await
+            .unwrap_err();
+        for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::remove_var(key);
+        }
+        let msg = err.to_string();
+        // Assert before joining: if the proxy were used, the server never
+        // gets a connection and join would block.
+        assert!(msg.contains("local LLM API 500"), "{msg}");
+        assert!(msg.contains("body not shown"), "{msg}");
+        assert!(!msg.contains("resting_hr"), "{msg}");
+        assert!(!msg.contains("52.00"), "{msg}");
+        server.join().unwrap();
     }
 
     #[test]
