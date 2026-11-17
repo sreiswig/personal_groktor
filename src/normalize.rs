@@ -199,6 +199,54 @@ mod tests {
         assert_eq!(p.day, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
     }
 
+    fn utc_at(hour: u32, min: u32, sec: u32, milli: u32) -> DateTime<Utc> {
+        Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 8, 1)
+                .unwrap()
+                .and_hms_milli_opt(hour, min, sec, milli)
+                .unwrap(),
+        )
+    }
+
+    /// Same-day samples are ordered by `recorded_at` (`metric_series` keeps the
+    /// last value). A fractional second the parser drops becomes noon, so a
+    /// morning reading and an evening reading collapse to one instant.
+    #[test]
+    fn naive_timestamps_with_fractional_seconds_keep_clock_time() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let cases = [
+            ("2026-08-01T08:00:00.123", utc_at(8, 0, 0, 123)),
+            ("2026-08-01T22:15:45.5", utc_at(22, 15, 45, 500)),
+            ("  2026-08-01 18:30:00.25  ", utc_at(18, 30, 0, 250)),
+        ];
+        let mut recorded = Vec::with_capacity(cases.len());
+        for (ts, expected) in cases {
+            let mut row = raw("2026-08-01", "hrv", 48.0);
+            row.timestamp = Some(ts.into());
+            let point = normalize_row(&row).expect(ts);
+            assert_eq!(point.day, day, "{ts}");
+            assert_eq!(point.recorded_at, expected, "{ts}");
+            recorded.push(point.recorded_at);
+        }
+        assert!(
+            recorded[0] < recorded[1],
+            "morning {} should sort before evening {}",
+            recorded[0],
+            recorded[1]
+        );
+    }
+
+    #[test]
+    fn naive_timestamps_without_fractional_seconds_stay_on_the_clock_time() {
+        let expected = utc_at(15, 45, 30, 0);
+        for ts in ["2026-08-01T15:45:30", "2026-08-01 15:45:30"] {
+            let mut row = raw("2026-08-01", "steps", 1000.0);
+            row.timestamp = Some(ts.into());
+            let point = normalize_row(&row).expect(ts);
+            assert_eq!(point.recorded_at, expected, "{ts}");
+        }
+    }
+
     #[test]
     fn rejects_non_finite_values() {
         for (value, shown) in [
