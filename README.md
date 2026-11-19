@@ -167,10 +167,9 @@ There is no default inbox path. The directory must already exist. The snapshot i
 
 Contract:
 
-- The snapshot is a consistent read of the live database, including commits that are still only in the live `-wal` file. The copy uses the SQLite online backup API. `VACUUM INTO` refuses a path that already exists, so it cannot fill a temp file created with `O_EXCL`.
-- The temp file is created in that same inbox directory. Its name starts with `.` and ends with `.tmp` (`.data.db.<random>.tmp`), with mode `0640` and `O_EXCL`. It is then switched to `journal_mode=DELETE` (rollback: header bytes 18 and 19 are 1). `PRAGMA integrity_check` must return `ok`. The handle is closed so no `-wal`, `-shm`, or `-journal` is left beside it.
-- The temp file is fsynced, `rename()`d over `data.db`, and the inbox directory is fsynced.
-- On failure the temp file is removed, an existing `data.db` is left as it was, and the process exits non-zero.
+- The snapshot is a consistent read of the live database, including commits that are still only in the live `-wal` file. It is built with `VACUUM INTO` in a private mode `0700` directory, then `journal_mode=DELETE` (rollback: header bytes 18 and 19 are 1) and `PRAGMA integrity_check` must return `ok`.
+- The inbox directory is opened once (`O_NOFOLLOW`, `O_DIRECTORY`). After that, every inbox step uses that directory fd (`openat`, `renameat`, `unlinkat`, `fsync`). The snapshot is placed there only at the end, as `.data.db.<random>.tmp` with mode `0640` and `O_EXCL`, then `renameat` over `data.db`, then `fsync` on the directory fd.
+- The whole export stops at 60 seconds. On timeout or any other failure the private files and the inbox temp name are removed, an existing `data.db` is left as it was, and the process exits non-zero.
 - If `data.db` or the inbox directory is a symlink, the export refuses it and does not follow the link.
 
 Open the published file with `immutable=1`. On a setgid inbox directory the file inherits that group, so mode `0640` is what a group-readable loader expects. The snapshot is a copy of your health database for self-reflection, not medical advice.

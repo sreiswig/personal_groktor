@@ -1,10 +1,9 @@
 //! Rollback-mode snapshot of the live health database for the warehouse loader.
 //!
-//! The live database stays in `journal_mode=WAL`. The snapshot is a separate
-//! file, `data.db`, in a caller-chosen inbox directory. `VACUUM INTO` cannot
-//! write a path that already exists, so it cannot fill a file created with
-//! `O_EXCL`. The copy uses the SQLite online backup API instead, then
-//! `journal_mode=DELETE` so the published file is rollback mode.
+//! The live database stays in `journal_mode=WAL`. The snapshot is built with
+//! `VACUUM INTO` in a private directory, then published through the inbox
+//! directory fd (`openat`, `renameat`, `fsync`). The inbox path is not used
+//! again after that directory is opened.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +15,7 @@ use crate::error::Result;
 ///
 /// `inbox` must already exist and must not be a symlink. `inbox/data.db`,
 /// when it already exists, must be a regular file. The previous `data.db` is
-/// left in place if anything fails before `rename`.
+/// left in place if anything fails before `renameat`.
 pub fn publish_snapshot(live_db: &Path, inbox: &Path) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -33,111 +32,177 @@ pub fn publish_snapshot(live_db: &Path, inbox: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::{CStr, CString, OsStr};
     use std::fs::{self, File, OpenOptions};
-    use std::io::{self, Read};
+    use std::io::{self, Read, Seek};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use rusqlite::backup::{Backup, StepResult};
-    use rusqlite::{Connection, OpenFlags};
+    use rusqlite::{Connection, ErrorCode, OpenFlags};
     use uuid::Uuid;
 
     use crate::error::{GroktorError, Result};
 
-    /// Group-readable, owner-writable. A setgid inbox directory (the warehouse
-    /// inbox is `2770`) gives the file the inbox group, so the loader can read
-    /// it. World has no bits. `fchmod` applies this even when umask is wider.
+    /// Group-readable, owner-writable. The warehouse inbox is mode `3750`
+    /// (setgid and sticky): a new file inherits the inbox group, so the loader
+    /// can read it, and the sticky bit keeps other users from unlinking it.
+    /// World has no bits. `fchmod` applies this even when umask is wider.
     const SNAPSHOT_MODE: u32 = 0o640;
+    const PRIVATE_DIR_MODE: u32 = 0o700;
     /// Linux `O_NOFOLLOW`.
     const O_NOFOLLOW: i32 = 0o400000;
     /// Linux `O_DIRECTORY`.
     const O_DIRECTORY: i32 = 0o200000;
     const SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
-    /// Bound for a source that keeps changing. A quiet health database finishes
-    /// well inside this. On timeout the temp file is removed and the previous
-    /// `data.db` stays.
-    const BACKUP_DEADLINE: Duration = Duration::from_secs(60);
+    /// Whole-export bound. A busy writer must not make this run longer, and
+    /// the previous `data.db` is not touched when the bound is hit.
+    const EXPORT_DEADLINE: Duration = Duration::from_secs(60);
 
     struct OpenedInbox {
-        path: PathBuf,
+        /// Directory fd. Every inbox step after `open_inbox` uses this, not the path.
         dir: File,
     }
 
-    struct TempGuard {
+    struct PrivateDir {
         path: PathBuf,
+    }
+
+    impl PrivateDir {
+        fn create() -> Result<Self> {
+            let path =
+                std::env::temp_dir().join(format!("groktor-export-{}", Uuid::new_v4().as_simple()));
+            let c_path = c_path(&path)?;
+            let rc = unsafe { libc::mkdir(c_path.as_ptr(), PRIVATE_DIR_MODE) };
+            if rc != 0 {
+                return Err(GroktorError::Message(format!(
+                    "failed to create a private snapshot directory: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            let dir = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+                .open(&path)
+                .map_err(|err| {
+                    let _ = fs::remove_dir(&path);
+                    GroktorError::Message(format!(
+                        "failed to open the private snapshot directory: {err}"
+                    ))
+                })?;
+            if let Err(err) = dir.set_permissions(fs::Permissions::from_mode(PRIVATE_DIR_MODE)) {
+                drop(dir);
+                let _ = fs::remove_dir(&path);
+                return Err(GroktorError::Message(format!(
+                    "failed to restrict the private snapshot directory: {err}"
+                )));
+            }
+            let mode = match dir.metadata() {
+                Ok(meta) => meta.permissions().mode() & 0o777,
+                Err(err) => {
+                    drop(dir);
+                    let _ = fs::remove_dir(&path);
+                    return Err(GroktorError::Message(format!(
+                        "failed to stat the private snapshot directory: {err}"
+                    )));
+                }
+            };
+            drop(dir);
+            if mode & !PRIVATE_DIR_MODE != 0 {
+                let _ = fs::remove_dir(&path);
+                return Err(GroktorError::Message(format!(
+                    "private snapshot directory mode is {mode:04o}; expected 0700 or tighter"
+                )));
+            }
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for PrivateDir {
+        fn drop(&mut self) {
+            match fs::symlink_metadata(&self.path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let _ = fs::remove_file(&self.path);
+                }
+                Ok(meta) if meta.is_dir() => {
+                    let _ = fs::remove_dir_all(&self.path);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Inbox temp name created with `openat`. Drop unlinks it unless `renameat`
+    /// has already consumed the name.
+    struct InboxTemp<'a> {
+        dir: &'a File,
+        name: CString,
         armed: bool,
     }
 
-    impl TempGuard {
-        fn arm(path: &Path) -> Self {
-            Self {
-                path: path.to_path_buf(),
-                armed: true,
-            }
-        }
-
-        fn commit(&mut self) {
-            self.armed = false;
-        }
-    }
-
-    impl Drop for TempGuard {
+    impl Drop for InboxTemp<'_> {
         fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            let _ = fs::remove_file(&self.path);
-            for suffix in SIDECAR_SUFFIXES {
-                let _ = fs::remove_file(sidecar_path(&self.path, suffix));
+            if self.armed {
+                let _ = unlink_name(self.dir, &self.name);
             }
         }
     }
 
     pub(super) fn publish(live_db: &Path, inbox: &Path) -> Result<PathBuf> {
-        let inbox = open_inbox(inbox)?;
-        let dest = inbox.path.join("data.db");
-        refuse_live_target(&dest, live_db)?;
-        require_regular_target(&dest)?;
-
-        let (tmp, created) = create_temp(&inbox.path)?;
-        debug_assert_eq!(tmp.parent(), Some(inbox.path.as_path()));
-        let mut guard = TempGuard::arm(&tmp);
-        write_and_publish(&inbox, &dest, live_db, &tmp, created, &mut guard)?;
+        let opened = open_inbox(inbox)?;
+        let dest = inbox.join("data.db");
+        if same_lexical_path(&dest, live_db) {
+            return Err(GroktorError::Message(format!(
+                "refusing to replace the live database ({}) with the snapshot",
+                live_db.display()
+            )));
+        }
+        publish_into(&opened, live_db)?;
         Ok(dest)
     }
 
-    fn write_and_publish(
-        inbox: &OpenedInbox,
-        dest: &Path,
-        live_db: &Path,
-        tmp: &Path,
-        created: (u64, u64),
-        guard: &mut TempGuard,
-    ) -> Result<()> {
-        copy_consistent(live_db, tmp, created)?;
-        ensure_no_sidecars(tmp)?;
-        ensure_rollback_header(tmp)?;
-        ensure_mode(tmp)?;
-        fsync_no_follow(tmp)?;
-        ensure_rollback_header(tmp)?;
-        refuse_live_target(dest, live_db)?;
-        require_regular_target(dest)?;
-        fs::rename(tmp, dest).map_err(|err| {
-            GroktorError::Message(format!(
-                "failed to rename snapshot onto {} (existing data.db was left unchanged): {err}",
-                dest.display()
-            ))
+    fn publish_into(inbox: &OpenedInbox, live_db: &Path) -> Result<()> {
+        let started = Instant::now();
+        check_deadline(started)?;
+        require_regular_target(&inbox.dir, live_db)?;
+        refuse_odd_sidecars(&inbox.dir)?;
+
+        let private = PrivateDir::create()?;
+        let snapshot = private.path.join("snapshot.db");
+        vacuum_into(live_db, &snapshot, started)?;
+        finalize_private_snapshot(&snapshot)?;
+        check_deadline(started)?;
+
+        require_regular_target(&inbox.dir, live_db)?;
+        refuse_odd_sidecars(&inbox.dir)?;
+
+        let (tmp_c, mut tmp_file) = create_inbox_temp(&inbox.dir)?;
+        let mut guard = InboxTemp {
+            dir: &inbox.dir,
+            name: tmp_c,
+            armed: true,
+        };
+        copy_private_into_fd(&snapshot, &mut tmp_file)?;
+        tmp_file.sync_all().map_err(|err| {
+            GroktorError::Message(format!("failed to fsync the inbox temp file: {err}"))
         })?;
-        // The temp name is gone. Disarm before any later step so a failure
-        // cannot unlink a different file that reused the name.
-        guard.commit();
-        remove_replaced_sidecars(dest)?;
-        ensure_no_sidecars(dest)?;
+        ensure_header_file(&mut tmp_file)?;
+        ensure_mode_fd(&tmp_file)?;
+        integrity_fd(&tmp_file)?;
+        check_deadline(started)?;
+        require_regular_target(&inbox.dir, live_db)?;
+        refuse_odd_sidecars(&inbox.dir)?;
+        drop(tmp_file);
+
+        rename_over_data_db(&inbox.dir, &guard.name)?;
+        guard.armed = false;
+        remove_file_sidecars(&inbox.dir)?;
         inbox.dir.sync_all().map_err(|err| {
             GroktorError::Message(format!(
-                "snapshot was renamed to {} but the inbox directory could not be fsynced: {err}",
-                dest.display()
+                "snapshot was renamed onto data.db but the inbox directory could not be fsynced: {err}"
             ))
         })?;
         Ok(())
@@ -196,70 +261,197 @@ mod linux {
                 inbox.display()
             )));
         }
-        Ok(OpenedInbox {
-            path: inbox.to_path_buf(),
-            dir,
-        })
+        Ok(OpenedInbox { dir })
     }
 
-    fn refuse_live_target(dest: &Path, live: &Path) -> Result<()> {
-        if same_database(dest, live) {
-            return Err(GroktorError::Message(format!(
-                "refusing to replace the live database ({}) with the snapshot",
-                live.display()
-            )));
-        }
-        Ok(())
-    }
-
-    fn same_database(dest: &Path, live: &Path) -> bool {
-        if let (Ok(dest_abs), Ok(live_abs)) = (std::path::absolute(dest), std::path::absolute(live))
-        {
-            if dest_abs == live_abs {
-                return true;
-            }
-        }
-        match (fs::symlink_metadata(dest), fs::symlink_metadata(live)) {
-            (Ok(dest_meta), Ok(live_meta)) => {
-                dest_meta.dev() == live_meta.dev() && dest_meta.ino() == live_meta.ino()
-            }
+    fn same_lexical_path(dest: &Path, live: &Path) -> bool {
+        match (std::path::absolute(dest), std::path::absolute(live)) {
+            (Ok(dest), Ok(live)) => dest == live,
             _ => false,
         }
     }
 
-    fn require_regular_target(dest: &Path) -> Result<()> {
-        match fs::symlink_metadata(dest) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+    fn require_regular_target(dir: &File, live_db: &Path) -> Result<()> {
+        match fstat_name(dir, c"data.db")? {
+            None => Ok(()),
+            Some(st) if is_lnk(&st) => Err(GroktorError::Message(
+                "export target is a symlink (data.db); refusing to follow it".into(),
+            )),
+            Some(st) if !is_reg(&st) => Err(GroktorError::Message(
+                "export target exists and is not a regular file: data.db".into(),
+            )),
+            Some(st) => {
+                if let Ok(live) = fs::metadata(live_db) {
+                    if live.dev() == st.st_dev && live.ino() == st.st_ino {
+                        return Err(GroktorError::Message(format!(
+                            "refusing to replace the live database ({}) with the snapshot",
+                            live_db.display()
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// A directory (or other non-file) sidecar cannot be unlinked with
+    /// `unlinkat`. Fail before `renameat` so `data.db` stays as it was.
+    fn refuse_odd_sidecars(dir: &File) -> Result<()> {
+        for suffix in SIDECAR_SUFFIXES {
+            let name = sidecar_cstr(suffix);
+            match fstat_name(dir, &name)? {
+                None => {}
+                Some(st) if is_reg(&st) || is_lnk(&st) => {}
+                Some(_) => {
+                    return Err(GroktorError::Message(format!(
+                        "sidecar data.db{suffix} is not a regular file; refusing to publish"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_file_sidecars(dir: &File) -> Result<()> {
+        for suffix in SIDECAR_SUFFIXES {
+            let name = sidecar_cstr(suffix);
+            match fstat_name(dir, &name)? {
+                None => {}
+                Some(st) if is_reg(&st) || is_lnk(&st) => {
+                    unlink_name(dir, &name).map_err(|err| {
+                        GroktorError::Message(format!(
+                            "failed to remove sidecar data.db{suffix} without following it: {err}"
+                        ))
+                    })?;
+                }
+                Some(_) => {
+                    return Err(GroktorError::Message(format!(
+                        "sidecar data.db{suffix} is not a regular file; left it in place"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn vacuum_into(live_db: &Path, dest: &Path, started: Instant) -> Result<()> {
+        check_deadline(started)?;
+        let dest_text = dest.to_str().ok_or_else(|| {
+            GroktorError::Message(
+                "private snapshot path is not valid UTF-8, so VACUUM INTO cannot name it".into(),
+            )
+        })?;
+        let src = Connection::open_with_flags(live_db, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+            |err| {
+                GroktorError::Message(format!(
+                    "failed to open the live database read-only ({}): {err}",
+                    live_db.display()
+                ))
+            },
+        )?;
+        let left = EXPORT_DEADLINE.saturating_sub(started.elapsed());
+        src.busy_timeout(left.min(Duration::from_secs(5)))?;
+        let interrupt = src.get_interrupt_handle();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if stop_rx.recv_timeout(left).is_err() {
+                interrupt.interrupt();
+            }
+        });
+        let vacuumed = src.execute("VACUUM INTO ?1", [dest_text]);
+        let _ = stop_tx.send(());
+        let _ = watchdog.join();
+        match vacuumed {
+            Ok(_) => Ok(()),
+            Err(err) if is_interrupt(&err) => Err(deadline_error()),
             Err(err) => Err(GroktorError::Message(format!(
-                "failed to inspect export target {}: {err}",
-                dest.display()
-            ))),
-            Ok(meta) if meta.file_type().is_symlink() => Err(GroktorError::Message(format!(
-                "export target is a symlink ({}); refusing to follow it",
-                dest.display()
-            ))),
-            Ok(meta) if meta.is_file() => Ok(()),
-            Ok(_) => Err(GroktorError::Message(format!(
-                "export target exists and is not a regular file: {}",
-                dest.display()
+                "failed to snapshot the live database ({}): {err}",
+                live_db.display()
             ))),
         }
     }
 
-    fn temp_file_name() -> String {
-        format!(".data.db.{}.tmp", Uuid::new_v4().as_simple())
+    fn finalize_private_snapshot(path: &Path) -> Result<()> {
+        let conn = Connection::open(path).map_err(|err| {
+            GroktorError::Message(format!(
+                "failed to open the private snapshot {}: {err}",
+                path.display()
+            ))
+        })?;
+        let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(GroktorError::Message(format!(
+                "snapshot journal_mode stayed {mode}; rollback mode (DELETE) is required"
+            )));
+        }
+        let messages = integrity_messages(&conn)?;
+        if messages != ["ok"] {
+            return Err(GroktorError::Message(format!(
+                "snapshot integrity_check failed: {}",
+                messages.join("; ")
+            )));
+        }
+        conn.close().map_err(|(_, err)| {
+            GroktorError::Message(format!(
+                "failed to close the private snapshot {}: {err}",
+                path.display()
+            ))
+        })?;
+        for suffix in SIDECAR_SUFFIXES {
+            let side = sidecar_path(path, suffix);
+            match fs::symlink_metadata(&side) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(GroktorError::Message(format!(
+                        "failed to inspect private sidecar {}: {err}",
+                        side.display()
+                    )));
+                }
+                Ok(_) => {
+                    return Err(GroktorError::Message(format!(
+                        "private snapshot left sidecar {}; refusing to publish",
+                        side.display()
+                    )));
+                }
+            }
+        }
+        let bytes = fs::read(path).map_err(|err| {
+            GroktorError::Message(format!(
+                "failed to read the private snapshot {}: {err}",
+                path.display()
+            ))
+        })?;
+        ensure_header_bytes(&bytes, path)?;
+        Ok(())
     }
 
-    fn create_temp(inbox: &Path) -> Result<(PathBuf, (u64, u64))> {
+    fn create_inbox_temp(dir: &File) -> Result<(CString, File)> {
         for _ in 0..8 {
-            let path = inbox.join(temp_file_name());
-            match create_exclusive(&path) {
-                Ok(ids) => return Ok((path, ids)),
+            let name = CString::new(temp_file_name()).map_err(|_| {
+                GroktorError::Message("snapshot temp name contains a NUL byte".into())
+            })?;
+            match openat_excl(dir, &name) {
+                Ok(file) => {
+                    if let Err(err) =
+                        file.set_permissions(fs::Permissions::from_mode(SNAPSHOT_MODE))
+                    {
+                        drop(file);
+                        let _ = unlink_name(dir, &name);
+                        return Err(GroktorError::Message(format!(
+                            "failed to set the inbox temp file mode: {err}"
+                        )));
+                    }
+                    if let Err(err) = ensure_mode_fd(&file) {
+                        drop(file);
+                        let _ = unlink_name(dir, &name);
+                        return Err(err);
+                    }
+                    return Ok((name, file));
+                }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     return Err(GroktorError::Message(format!(
-                        "failed to create snapshot temp file in {}: {err}",
-                        inbox.display()
+                        "failed to create snapshot temp file in the inbox: {err}"
                     )));
                 }
             }
@@ -269,150 +461,71 @@ mod linux {
         ))
     }
 
-    fn create_exclusive(path: &Path) -> io::Result<(u64, u64)> {
-        let mut opts = OpenOptions::new();
-        opts.read(true)
-            .write(true)
-            .create_new(true)
-            .mode(SNAPSHOT_MODE)
-            .custom_flags(O_NOFOLLOW);
-        let file = opts.open(path)?;
-        let finished = (|| -> io::Result<(u64, u64)> {
-            file.set_permissions(fs::Permissions::from_mode(SNAPSHOT_MODE))?;
-            let meta = file.metadata()?;
-            let mode = meta.permissions().mode() & 0o777;
-            if !mode_is_acceptable(mode) {
-                return Err(io::Error::other(format!(
-                    "temp file mode is {mode:04o}, want 0640 or tighter"
-                )));
-            }
-            Ok((meta.dev(), meta.ino()))
-        })();
-        match finished {
-            Ok(ids) => Ok(ids),
-            Err(err) => {
-                drop(file);
-                let _ = fs::remove_file(path);
-                Err(err)
-            }
-        }
-    }
-
-    fn mode_is_acceptable(mode: u32) -> bool {
-        let bits = mode & 0o777;
-        bits & !SNAPSHOT_MODE == 0 && bits & 0o600 == 0o600
-    }
-
-    fn copy_consistent(live_db: &Path, tmp: &Path, created: (u64, u64)) -> Result<()> {
-        // Read-only so this connection cannot create the live file, change its
-        // journal mode, or checkpoint it. Committed WAL frames are visible
-        // while another connection (the open Store) holds the -shm.
-        let src = Connection::open_with_flags(live_db, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-            |err| {
+    fn copy_private_into_fd(src_path: &Path, dest: &mut File) -> Result<()> {
+        let mut src = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(src_path)
+            .map_err(|err| {
                 GroktorError::Message(format!(
-                    "failed to open the live database read-only ({}): {err}",
-                    live_db.display()
+                    "failed to read the private snapshot {}: {err}",
+                    src_path.display()
                 ))
-            },
-        )?;
-        src.busy_timeout(Duration::from_secs(5))?;
-        src.execute_batch("PRAGMA query_only = ON;")?;
-
-        let mut dest = Connection::open(tmp).map_err(|err| {
+            })?;
+        let expected = src
+            .metadata()
+            .map_err(|err| {
+                GroktorError::Message(format!("failed to stat the private snapshot: {err}"))
+            })?
+            .len();
+        let copied = io::copy(&mut src, dest).map_err(|err| {
             GroktorError::Message(format!(
-                "failed to open snapshot temp file {}: {err}",
-                tmp.display()
+                "failed to copy the snapshot into the inbox temp file: {err}"
             ))
         })?;
-        confirm_same_file(tmp, created)?;
-        dest.busy_timeout(Duration::from_secs(5))?;
-
-        {
-            let backup = Backup::new(&src, &mut dest)?;
-            backup_to_completion(&backup)?;
-        }
-
-        let mode: String = dest.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("delete") {
+        if copied != expected {
             return Err(GroktorError::Message(format!(
-                "snapshot journal_mode stayed {mode}; rollback mode (DELETE) is required"
+                "inbox temp file received {copied} bytes of a {expected} byte snapshot"
             )));
         }
-        let messages = integrity_messages(&dest)?;
+        Ok(())
+    }
+
+    fn rename_over_data_db(dir: &File, tmp_name: &CStr) -> Result<()> {
+        let rc = unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                tmp_name.as_ptr(),
+                dir.as_raw_fd(),
+                c"data.db".as_ptr(),
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(GroktorError::Message(format!(
+                "failed to rename snapshot onto data.db (existing data.db was left unchanged): {}",
+                io::Error::last_os_error()
+            )))
+        }
+    }
+
+    fn integrity_fd(file: &File) -> Result<()> {
+        let uri = format!("file:/proc/self/fd/{}?immutable=1", file.as_raw_fd());
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|err| {
+            GroktorError::Message(format!(
+                "failed to open the inbox snapshot for integrity_check: {err}"
+            ))
+        })?;
+        let messages = integrity_messages(&conn)?;
         if messages != ["ok"] {
             return Err(GroktorError::Message(format!(
                 "snapshot integrity_check failed: {}",
                 messages.join("; ")
-            )));
-        }
-
-        dest.close().map_err(|(_, err)| {
-            GroktorError::Message(format!(
-                "failed to close snapshot temp file {}: {err}",
-                tmp.display()
-            ))
-        })?;
-        src.close().map_err(|(_, err)| {
-            GroktorError::Message(format!(
-                "failed to close the read-only live database handle ({}): {err}",
-                live_db.display()
-            ))
-        })?;
-        Ok(())
-    }
-
-    fn backup_to_completion(backup: &Backup) -> Result<()> {
-        let deadline = Instant::now() + BACKUP_DEADLINE;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(GroktorError::Message(
-                    "snapshot backup did not finish within 60s; the live database stayed busy \
-                     and the previous data.db was left unchanged"
-                        .into(),
-                ));
-            }
-            match backup.step(64)? {
-                StepResult::Done => return Ok(()),
-                StepResult::More | StepResult::Busy | StepResult::Locked => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                _ => {
-                    return Err(GroktorError::Message(
-                        "snapshot backup returned an unexpected step result; the previous data.db was left unchanged"
-                            .into(),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn confirm_same_file(path: &Path, created: (u64, u64)) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .map_err(|err| {
-                GroktorError::Message(format!(
-                    "snapshot temp file {} could not be reopened without following a symlink: {err}",
-                    path.display()
-                ))
-            })?;
-        let meta = file.metadata().map_err(|err| {
-            GroktorError::Message(format!(
-                "failed to stat snapshot temp file {}: {err}",
-                path.display()
-            ))
-        })?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(GroktorError::Message(format!(
-                "snapshot temp file {} is no longer a regular file",
-                path.display()
-            )));
-        }
-        if (meta.dev(), meta.ino()) != created {
-            return Err(GroktorError::Message(format!(
-                "snapshot temp file {} was replaced after it was created; refusing to follow it",
-                path.display()
             )));
         }
         Ok(())
@@ -428,131 +541,77 @@ mod linux {
         Ok(messages)
     }
 
-    fn ensure_no_sidecars(db: &Path) -> Result<()> {
-        for suffix in SIDECAR_SUFFIXES {
-            let path = sidecar_path(db, suffix);
-            match fs::symlink_metadata(&path) {
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(GroktorError::Message(format!(
-                        "failed to inspect sidecar {}: {err}",
-                        path.display()
-                    )));
-                }
-                Ok(_) => {
-                    return Err(GroktorError::Message(format!(
-                        "snapshot left sidecar {}; refusing to publish a file that is not a single rollback database",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop `-wal` / `-shm` / `-journal` names left beside a previous `data.db`.
-    /// `remove_file` unlinks a symlink and does not follow it.
-    fn remove_replaced_sidecars(db: &Path) -> Result<()> {
-        for suffix in SIDECAR_SUFFIXES {
-            let path = sidecar_path(db, suffix);
-            match fs::symlink_metadata(&path) {
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(GroktorError::Message(format!(
-                        "failed to inspect sidecar {}: {err}",
-                        path.display()
-                    )));
-                }
-                Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
-                    fs::remove_file(&path).map_err(|err| {
-                        GroktorError::Message(format!(
-                            "failed to remove sidecar {} without following it: {err}",
-                            path.display()
-                        ))
-                    })?;
-                }
-                Ok(_) => {
-                    return Err(GroktorError::Message(format!(
-                        "sidecar {} is not a regular file; left it in place",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_rollback_header(path: &Path) -> Result<()> {
-        let (write_version, read_version) = header_versions(path)?;
-        if write_version != 1 || read_version != 1 {
-            return Err(GroktorError::Message(format!(
-                "snapshot is not in rollback journal mode (header bytes 18 and 19 are {write_version} and {read_version}, expected 1 and 1)"
-            )));
-        }
-        Ok(())
-    }
-
-    fn header_versions(path: &Path) -> Result<(u8, u8)> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
-            .map_err(|err| {
-                GroktorError::Message(format!(
-                    "failed to read snapshot header {}: {err}",
-                    path.display()
-                ))
-            })?;
+    fn ensure_header_file(file: &mut File) -> Result<()> {
+        file.rewind().map_err(|err| {
+            GroktorError::Message(format!("failed to rewind the inbox snapshot: {err}"))
+        })?;
         let mut hdr = [0u8; 20];
         file.read_exact(&mut hdr).map_err(|err| {
             GroktorError::Message(format!(
-                "snapshot {} is too small to be a SQLite database: {err}",
-                path.display()
+                "inbox snapshot is too small to be a SQLite database: {err}"
             ))
         })?;
-        if &hdr[0..16] != b"SQLite format 3\0" {
+        ensure_header_bytes(&hdr, Path::new("data.db"))
+    }
+
+    fn ensure_header_bytes(bytes: &[u8], path: &Path) -> Result<()> {
+        if bytes.len() < 20 || &bytes[0..16] != b"SQLite format 3\0" {
             return Err(GroktorError::Message(format!(
                 "snapshot {} is not a SQLite database",
                 path.display()
             )));
         }
-        Ok((hdr[18], hdr[19]))
-    }
-
-    fn ensure_mode(path: &Path) -> Result<()> {
-        let meta = fs::symlink_metadata(path).map_err(|err| {
-            GroktorError::Message(format!("failed to stat snapshot {}: {err}", path.display()))
-        })?;
-        if meta.file_type().is_symlink() {
+        if bytes[18] != 1 || bytes[19] != 1 {
             return Err(GroktorError::Message(format!(
-                "snapshot {} is a symlink; refusing to follow it",
-                path.display()
-            )));
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if !mode_is_acceptable(mode) {
-            return Err(GroktorError::Message(format!(
-                "snapshot mode is {mode:04o}; expected 0640 or tighter with owner read and write"
+                "snapshot is not in rollback journal mode (header bytes 18 and 19 are {} and {}, expected 1 and 1)",
+                bytes[18], bytes[19]
             )));
         }
         Ok(())
     }
 
-    fn fsync_no_follow(path: &Path) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW)
-            .open(path)
+    fn ensure_mode_fd(file: &File) -> Result<()> {
+        let mode = file
+            .metadata()
             .map_err(|err| {
-                GroktorError::Message(format!(
-                    "failed to open {} for fsync: {err}",
-                    path.display()
-                ))
-            })?;
-        file.sync_all().map_err(|err| {
-            GroktorError::Message(format!("failed to fsync {}: {err}", path.display()))
-        })?;
+                GroktorError::Message(format!("failed to stat the inbox snapshot: {err}"))
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != SNAPSHOT_MODE {
+            return Err(GroktorError::Message(format!(
+                "snapshot mode is {mode:04o}; expected 0640"
+            )));
+        }
         Ok(())
+    }
+
+    fn check_deadline(started: Instant) -> Result<()> {
+        if started.elapsed() >= EXPORT_DEADLINE {
+            Err(deadline_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn deadline_error() -> GroktorError {
+        GroktorError::Message(
+            "snapshot export did not finish within 60s; the previous data.db was left unchanged"
+                .into(),
+        )
+    }
+
+    fn is_interrupt(err: &rusqlite::Error) -> bool {
+        matches!(
+            err,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == ErrorCode::OperationInterrupted
+        )
+    }
+
+    fn temp_file_name() -> String {
+        format!(".data.db.{}.tmp", Uuid::new_v4().as_simple())
     }
 
     fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
@@ -561,9 +620,75 @@ mod linux {
         PathBuf::from(name)
     }
 
+    fn sidecar_cstr(suffix: &str) -> CString {
+        CString::new(format!("data.db{suffix}")).expect("sidecar name has no NUL")
+    }
+
+    fn c_path(path: &Path) -> Result<CString> {
+        CString::new(OsStr::as_bytes(path.as_os_str())).map_err(|_| {
+            GroktorError::Message(format!("path {} contains a NUL byte", path.display()))
+        })
+    }
+
+    fn fstat_name(dir: &File, name: &CStr) -> Result<Option<libc::stat>> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(Some(unsafe { st.assume_init() }))
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(GroktorError::Message(format!(
+                    "failed to inspect inbox entry: {err}"
+                )))
+            }
+        }
+    }
+
+    fn openat_excl(dir: &File, name: &CStr) -> io::Result<File> {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                SNAPSHOT_MODE as libc::mode_t,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    fn unlink_name(dir: &File, name: &CStr) -> io::Result<()> {
+        let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn is_reg(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    fn is_lnk(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+
     #[cfg(test)]
     mod tests {
-        use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
 
@@ -677,24 +802,34 @@ mod linux {
         }
 
         #[test]
+        fn private_snapshot_dir_is_owner_only() {
+            let dir = PrivateDir::create().unwrap();
+            assert_eq!(mode_of(&dir.path), 0o700);
+        }
+
+        #[test]
         fn exclusive_create_sets_mode_and_does_not_follow_a_symlink() {
             let dir = tempfile::TempDir::new().unwrap();
+            let opened = open_inbox(dir.path()).unwrap();
             let target = dir.path().join("target");
             fs::write(&target, b"keep").unwrap();
-            let link = dir.path().join(".data.db.link.tmp");
-            std::os::unix::fs::symlink(&target, &link).unwrap();
-            let err = create_exclusive(&link).unwrap_err();
+            let link_name = c".data.db.link.tmp";
+            std::os::unix::fs::symlink(&target, dir.path().join(".data.db.link.tmp")).unwrap();
+            let err = openat_excl(&opened.dir, link_name).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
             assert_eq!(fs::read(&target).unwrap(), b"keep");
-            assert!(fs::symlink_metadata(&link)
+            assert!(fs::symlink_metadata(dir.path().join(".data.db.link.tmp"))
                 .unwrap()
                 .file_type()
                 .is_symlink());
 
-            let fresh = dir.path().join(".data.db.fresh.tmp");
-            create_exclusive(&fresh).unwrap();
-            assert_eq!(mode_of(&fresh), 0o640);
-            let again = create_exclusive(&fresh).unwrap_err();
+            let fresh = CString::new(".data.db.fresh.tmp").unwrap();
+            let file = openat_excl(&opened.dir, &fresh).unwrap();
+            file.set_permissions(fs::Permissions::from_mode(SNAPSHOT_MODE))
+                .unwrap();
+            drop(file);
+            assert_eq!(mode_of(&dir.path().join(".data.db.fresh.tmp")), 0o640);
+            let again = openat_excl(&opened.dir, &fresh).unwrap_err();
             assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
         }
 
@@ -844,6 +979,24 @@ mod linux {
         }
 
         #[test]
+        fn directory_sidecar_is_refused_before_replacing_data_db() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let live = dir.path().join("live.db");
+            let store = Store::open(&live).unwrap();
+            insert_point(&store, 9.0);
+            let inbox = dir.path().join("inbox");
+            fs::create_dir(&inbox).unwrap();
+            let dest = inbox.join("data.db");
+            fs::write(&dest, b"KEEP").unwrap();
+            fs::create_dir(inbox.join("data.db-wal")).unwrap();
+            let err = publish_snapshot(&live, &inbox).unwrap_err();
+            assert!(err.to_string().contains("sidecar"), "{err}");
+            assert_eq!(fs::read(&dest).unwrap(), b"KEEP");
+            assert!(inbox.join("data.db-wal").is_dir());
+            assert!(dot_tmps(&inbox).is_empty(), "{:?}", dot_tmps(&inbox));
+        }
+
+        #[test]
         fn refuses_to_replace_the_live_database() {
             let dir = tempfile::TempDir::new().unwrap();
             let live = dir.path().join("data.db");
@@ -875,11 +1028,125 @@ mod linux {
         }
 
         #[test]
-        fn concurrent_writer_during_export_yields_a_consistent_snapshot() {
+        fn export_stays_on_the_opened_directory_fd() {
             let dir = tempfile::TempDir::new().unwrap();
             let live = dir.path().join("live.db");
             let store = Store::open(&live).unwrap();
-            drop(store);
+            let point = insert_point(&store, 4.0);
+            let inbox = dir.path().join("inbox");
+            fs::create_dir(&inbox).unwrap();
+            let opened = open_inbox(&inbox).unwrap();
+            let saved = dir.path().join("inbox-real");
+            fs::rename(&inbox, &saved).unwrap();
+            let victim = dir.path().join("victim");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("data.db"), b"VICTIM").unwrap();
+            fs::write(victim.join("data.db-wal"), b"VICTIM-WAL").unwrap();
+            std::os::unix::fs::symlink(&victim, &inbox).unwrap();
+
+            publish_into(&opened, &live).unwrap();
+
+            let published = saved.join("data.db");
+            assert!(published.is_file());
+            assert_eq!(header_pair(&published), (1, 1));
+            assert_eq!(mode_of(&published), 0o640);
+            let conn = open_immutable(&published);
+            let ids = metric_ids(&conn);
+            drop(conn);
+            assert!(ids.contains(&point.id.to_string()), "{ids:?}");
+            assert_eq!(fs::read(victim.join("data.db")).unwrap(), b"VICTIM");
+            assert_eq!(fs::read(victim.join("data.db-wal")).unwrap(), b"VICTIM-WAL");
+            assert!(dot_tmps(&saved).is_empty(), "{:?}", dot_tmps(&saved));
+            assert!(dot_tmps(&victim).is_empty(), "{:?}", dot_tmps(&victim));
+        }
+
+        #[test]
+        fn busy_writer_cannot_outrun_the_export_deadline() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let live = dir.path().join("live.db");
+            drop(Store::open(&live).unwrap());
+
+            let commits = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let commits_writer = Arc::clone(&commits);
+            let stop_writer = Arc::clone(&stop);
+            let live_writer = live.clone();
+            let writer = std::thread::spawn(move || {
+                let conn = Connection::open(&live_writer).unwrap();
+                conn.busy_timeout(Duration::from_millis(200)).unwrap();
+                let mut i = 0i64;
+                while !stop_writer.load(Ordering::Relaxed) {
+                    if conn
+                        .execute_batch(&format!(
+                            "BEGIN;
+                             INSERT INTO metrics
+                                (id, kind, category, recorded_at, day, value, unit, source)
+                             VALUES ('w{i}a', 'steps', 'activity', '2026-08-01T00:00:00Z',
+                                     '2026-08-01', {i}.0, 'count', 'writer');
+                             INSERT INTO metrics
+                                (id, kind, category, recorded_at, day, value, unit, source)
+                             VALUES ('w{i}b', 'steps', 'activity', '2026-08-01T00:00:01Z',
+                                     '2026-08-01', {i}.0, 'count', 'writer');
+                             COMMIT;"
+                        ))
+                        .is_ok()
+                    {
+                        commits_writer.fetch_add(1, Ordering::SeqCst);
+                        i += 1;
+                    }
+                }
+            });
+
+            let wait_started = Instant::now();
+            while commits.load(Ordering::SeqCst) < 5 {
+                assert!(
+                    wait_started.elapsed() < Duration::from_secs(5),
+                    "writer did not commit"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            let inbox = dir.path().join("inbox");
+            fs::create_dir(&inbox).unwrap();
+            let started = Instant::now();
+            let result = publish_snapshot(&live, &inbox);
+            let elapsed = started.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+
+            assert!(
+                elapsed < EXPORT_DEADLINE,
+                "busy writer made export run for {elapsed:?}"
+            );
+            let published = result.expect("busy writer should not stall VACUUM INTO");
+            assert_eq!(published, inbox.join("data.db"));
+            assert_eq!(header_pair(&published), (1, 1));
+            assert_eq!(mode_of(&published), 0o640);
+            assert!(dot_tmps(&inbox).is_empty(), "{:?}", dot_tmps(&inbox));
+            let conn = open_immutable(&published);
+            let ids = metric_ids(&conn);
+            drop(conn);
+            let mut batches = std::collections::BTreeMap::<i64, usize>::new();
+            for id in &ids {
+                let Some(rest) = id.strip_prefix('w') else {
+                    continue;
+                };
+                let (n, which) = rest.split_at(rest.len() - 1);
+                assert!(which == "a" || which == "b", "{id}");
+                *batches.entry(n.parse().unwrap()).or_insert(0) += 1;
+            }
+            assert!(!batches.is_empty(), "snapshot missed the writer's commits");
+            for (batch, count) in &batches {
+                assert_eq!(*count, 2, "torn batch {batch}");
+            }
+            assert_eq!(header_pair(&live), (2, 2));
+        }
+
+        #[test]
+        fn concurrent_writer_during_export_yields_a_consistent_snapshot() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let live = dir.path().join("live.db");
+            drop(Store::open(&live).unwrap());
 
             let commits = Arc::new(AtomicU64::new(0));
             let commits_writer = Arc::clone(&commits);
@@ -917,7 +1184,7 @@ mod linux {
             let snap = open_immutable(&inbox.join("data.db"));
             let ids = metric_ids(&snap);
             drop(snap);
-            let mut batches: BTreeMap<i64, usize> = BTreeMap::new();
+            let mut batches = std::collections::BTreeMap::<i64, usize>::new();
             for id in &ids {
                 let rest = id.strip_prefix('b').expect(id);
                 let (n, which) = rest.split_at(rest.len() - 1);

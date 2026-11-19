@@ -16,7 +16,7 @@ Global `--db PATH` or `GROKTOR_DB` overrides the default database (`~/.local/sha
 
 Typical loop: `ingest` → `analyze` (optional; `brief` re-runs rules) → `brief`.
 
-`export` writes one rollback-mode `data.db` for the warehouse loader. There is no default inbox path and no network listener. The temp file is `.data.db.<random>.tmp` in that directory (`O_EXCL`, mode 0640), then fsync, `rename` over `data.db`, then fsync the directory. Header bytes 18 and 19 of the snapshot are 1. Symlinks are refused. Failure removes the temp file, leaves the previous `data.db`, and exits non-zero. The live database stays `journal_mode=WAL`.
+`export` writes one rollback-mode `data.db` for the warehouse loader. There is no default inbox path and no network listener. The snapshot is built with `VACUUM INTO` in a private `0700` directory. The inbox is opened once and every later inbox step uses that directory fd: `openat` of `.data.db.<random>.tmp` (`O_EXCL`, mode 0640), `renameat` over `data.db`, then `fsync` of the directory fd. Header bytes 18 and 19 of the snapshot are 1. Symlinks are refused. A busy live writer cannot make the export run past 60 seconds. Failure removes the temp file, leaves the previous `data.db`, and exits non-zero. The live database stays `journal_mode=WAL`.
 
 ## LLM
 
