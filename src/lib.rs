@@ -6,6 +6,7 @@
 pub mod analyze;
 pub mod brief;
 pub mod error;
+pub mod export;
 pub mod ingest;
 pub mod lab;
 pub mod llm;

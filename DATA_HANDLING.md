@@ -24,6 +24,7 @@ Personal GrokTor touches health-adjacent local data and optional LLM calls. Trea
 
 ## Exports & sharing
 
+- [ ] `export --inbox` (or `GROKTOR_EXPORT_INBOX`) copies the health DB into an inbox you choose. Point it only at a local directory you trust. The command refuses a symlink inbox and a symlink `data.db`, and it does not change the live database's WAL mode.
 - [ ] Never commit real exports (JSON/CSV/SQLite copies) "for debugging."
 - [ ] If you need fixtures: synthesize fake rows; mark them `FIXTURE` / `SYNTHETIC`.
 - [ ] Before attaching files to issues/PRs: scan for names, dates of birth, device IDs, API keys.
