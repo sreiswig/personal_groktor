@@ -191,7 +191,6 @@ mod linux {
         })?;
         ensure_header_file(&mut tmp_file)?;
         ensure_mode_fd(&tmp_file)?;
-        integrity_fd(&tmp_file)?;
         check_deadline(started)?;
         require_regular_target(&inbox.dir, live_db)?;
         refuse_odd_sidecars(&inbox.dir)?;
@@ -508,27 +507,6 @@ mod linux {
                 io::Error::last_os_error()
             )))
         }
-    }
-
-    fn integrity_fd(file: &File) -> Result<()> {
-        let uri = format!("file:/proc/self/fd/{}?immutable=1", file.as_raw_fd());
-        let conn = Connection::open_with_flags(
-            &uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|err| {
-            GroktorError::Message(format!(
-                "failed to open the inbox snapshot for integrity_check: {err}"
-            ))
-        })?;
-        let messages = integrity_messages(&conn)?;
-        if messages != ["ok"] {
-            return Err(GroktorError::Message(format!(
-                "snapshot integrity_check failed: {}",
-                messages.join("; ")
-            )));
-        }
-        Ok(())
     }
 
     fn integrity_messages(conn: &Connection) -> Result<Vec<String>> {
