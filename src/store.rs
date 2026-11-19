@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::error::{GroktorError, Result};
+use crate::private_fs;
 use crate::schema::{
     Annotation, Arm, Digest, DigestConfidence, DigestHorizon, Experiment, ExperimentDay,
     ExperimentStatus, Finding, MetricCategory, MetricKind, MetricPoint, OutcomeSpec, Severity,
@@ -17,11 +18,39 @@ pub struct Store {
     path: PathBuf,
 }
 
+/// Files SQLite may create next to the DB (WAL mode uses `-wal` / `-shm`).
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// `:memory:` and `file:` URIs are not plain paths to pre-create.
+fn is_on_disk_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    !(s.is_empty() || s == ":memory:" || s.starts_with("file:"))
+}
+
+fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut os = db.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
 impl Store {
+    /// Open (or create) the health DB.
+    ///
+    /// New parent directories are created 0700 and the DB file is created
+    /// 0600 *before* SQLite opens it. SQLite's unix VFS gives `-wal`, `-shm`
+    /// and `-journal` files the same mode as the main DB, so the sidecars it
+    /// creates later are 0600 too; any sidecars left by an older build are
+    /// narrowed here.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if is_on_disk_path(&path) {
+            if let Some(parent) = path.parent() {
+                private_fs::create_private_dir_all(parent)?;
+            }
+            private_fs::ensure_private_file(&path)?;
+            for suffix in SQLITE_SIDECAR_SUFFIXES {
+                private_fs::restrict_if_exists(&sidecar_path(&path, suffix))?;
+            }
         }
         let conn = Connection::open(&path)?;
         let store = Self { conn, path };
@@ -888,6 +917,49 @@ mod tests {
     use super::*;
     use crate::schema::{ConfidenceLevel, Direction, MetricKind};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn db_sidecars_and_new_parent_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("share/personal_groktor/data.db");
+        let store = Store::open(&db).unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let p = MetricPoint::new(MetricKind::Steps, Utc::now(), day, 9000.0, "count", "test");
+        store.upsert_metrics(&[p]).unwrap();
+
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&dir.path().join("share")), 0o700);
+        assert_eq!(mode(&dir.path().join("share/personal_groktor")), 0o700);
+        let mut saw_sidecar = false;
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let side = sidecar_path(&db, suffix);
+            if side.exists() {
+                saw_sidecar = true;
+                assert_eq!(mode(&side), 0o600, "{}", side.display());
+            }
+        }
+        assert!(
+            saw_sidecar,
+            "WAL mode should leave -wal/-shm while the connection is open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_narrows_an_existing_world_readable_db() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("old.db");
+        drop(Store::open(&db).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(Store::open(&db).unwrap());
+        let m = std::fs::metadata(&db).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o600);
+    }
 
     #[test]
     fn round_trip_metrics() {
