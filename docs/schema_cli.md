@@ -372,7 +372,7 @@ personal_groktor [GLOBAL] <command>
 | `lab` | **exists** | Experiments (start, arms, report) |
 | `research` | planned | Literature agent (see research doc) |
 | `status` | **exists** | Health + notes + labs (research TBD) |
-| `export --inbox DIR` | **exists** | Rollback-mode `data.db` for the warehouse loader (`GROKTOR_EXPORT_INBOX`). See the README. Live DB stays WAL. |
+| `export [--inbox DIR]` | **exists** | Rollback-mode `data.db` for the warehouse loader. Default `/var/lib/warehouse-inbox/health` (`GROKTOR_EXPORT_INBOX`). See the README. Live DB stays WAL. |
 | `sync` | later | Watch-folder / drop-dir ingest |
 
 ### `brief`

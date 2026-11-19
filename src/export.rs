@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use crate::error::GroktorError;
 use crate::error::Result;
 
+/// Default warehouse inbox. `/var/lib/warehouse-inbox` is mode `0750`
+/// `root:warehouse`. This directory is mode `3750` `sam:warehouse`.
+pub const DEFAULT_WAREHOUSE_INBOX: &str = "/var/lib/warehouse-inbox/health";
+
 /// Publish a consistent snapshot of `live_db` as `inbox/data.db`.
 ///
 /// `inbox` must already exist and must not be a symlink. `inbox/data.db`,
@@ -61,6 +65,10 @@ mod linux {
     /// Whole-export bound. A busy writer must not make this run longer, and
     /// the previous `data.db` is not touched when the bound is hit.
     const EXPORT_DEADLINE: Duration = Duration::from_secs(60);
+    /// Leave artifacts younger than this alone so a live export is not swept.
+    /// The margin is another full deadline past `EXPORT_DEADLINE`.
+    const STALE_AFTER: Duration = Duration::from_secs(120);
+    const PRIVATE_DIR_PREFIX: &str = "groktor-export-";
 
     struct OpenedInbox {
         /// Directory fd. Every inbox step after `open_inbox` uses this, not the path.
@@ -73,8 +81,7 @@ mod linux {
 
     impl PrivateDir {
         fn create() -> Result<Self> {
-            let path =
-                std::env::temp_dir().join(format!("groktor-export-{}", Uuid::new_v4().as_simple()));
+            let path = std::env::temp_dir().join(private_dir_name());
             let c_path = c_path(&path)?;
             let rc = unsafe { libc::mkdir(c_path.as_ptr(), PRIVATE_DIR_MODE) };
             if rc != 0 {
@@ -166,6 +173,9 @@ mod linux {
 
     fn publish_into(inbox: &OpenedInbox, live_db: &Path) -> Result<()> {
         let started = Instant::now();
+        // Best-effort. A sweep problem must not replace `data.db` or follow a link.
+        sweep_stale_private_dirs();
+        sweep_stale_inbox_temps(&inbox.dir);
         check_deadline(started)?;
         require_regular_target(&inbox.dir, live_db)?;
         refuse_odd_sidecars(&inbox.dir)?;
@@ -665,6 +675,245 @@ mod linux {
         st.st_mode & libc::S_IFMT == libc::S_IFLNK
     }
 
+    fn is_dir_mode(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    fn private_dir_name() -> String {
+        format!("{PRIVATE_DIR_PREFIX}{}", Uuid::new_v4().as_simple())
+    }
+
+    fn is_private_dir_name(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix(PRIVATE_DIR_PREFIX) else {
+            return false;
+        };
+        is_uuid_simple(rest)
+    }
+
+    fn is_inbox_tmp_name(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix(".data.db.") else {
+            return false;
+        };
+        let Some(hex) = rest.strip_suffix(".tmp") else {
+            return false;
+        };
+        is_uuid_simple(hex)
+    }
+
+    fn is_uuid_simple(text: &str) -> bool {
+        text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn is_private_child_name(name: &str) -> bool {
+        name == "snapshot.db"
+            || name == "snapshot.db-wal"
+            || name == "snapshot.db-shm"
+            || name == "snapshot.db-journal"
+    }
+
+    /// `true` only for a non-symlink of the expected type, owned by `our`, and
+    /// last modified at least `STALE_AFTER` before `now`.
+    fn owns_and_is_stale(st: &libc::stat, our: u32, now: i64, directory: bool) -> bool {
+        if is_lnk(st) {
+            return false;
+        }
+        if directory {
+            if !is_dir_mode(st) {
+                return false;
+            }
+        } else if !is_reg(st) {
+            return false;
+        }
+        if st.st_uid != our {
+            return false;
+        }
+        now.saturating_sub(st.st_mtime) >= i64::try_from(STALE_AFTER.as_secs()).unwrap_or(i64::MAX)
+    }
+
+    fn our_euid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    fn unix_now() -> i64 {
+        unsafe { libc::time(std::ptr::null_mut()) }
+    }
+
+    /// Drop this process's old `groktor-export-<uuid>` directories under the
+    /// temp directory. Symlinks are left in place. The temp directory itself
+    /// is not followed if it is a symlink.
+    fn sweep_stale_private_dirs() {
+        let parent_path = std::env::temp_dir();
+        let Ok(listed) = fs::symlink_metadata(&parent_path) else {
+            return;
+        };
+        if listed.file_type().is_symlink() || !listed.is_dir() {
+            return;
+        }
+        let Ok(parent) = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+            .open(&parent_path)
+        else {
+            return;
+        };
+        let Ok(opened) = parent.metadata() else {
+            return;
+        };
+        if opened.dev() != listed.dev() || opened.ino() != listed.ino() {
+            return;
+        }
+        let Ok(names) = list_dir_names(&parent) else {
+            return;
+        };
+        let our = our_euid();
+        let now = unix_now();
+        for name in names {
+            let Ok(text) = name.to_str() else {
+                continue;
+            };
+            if !is_private_dir_name(text) {
+                continue;
+            }
+            let Ok(Some(st)) = fstat_name(&parent, &name) else {
+                continue;
+            };
+            if !owns_and_is_stale(&st, our, now, true) {
+                continue;
+            }
+            let _ = remove_private_dir_at(&parent, &name, &st);
+        }
+    }
+
+    /// Drop this process's old `.data.db.<uuid>.tmp` files in the opened inbox.
+    fn sweep_stale_inbox_temps(dir: &File) {
+        let Ok(names) = list_dir_names(dir) else {
+            return;
+        };
+        let our = our_euid();
+        let now = unix_now();
+        for name in names {
+            let Ok(text) = name.to_str() else {
+                continue;
+            };
+            if !is_inbox_tmp_name(text) {
+                continue;
+            }
+            let Ok(Some(st)) = fstat_name(dir, &name) else {
+                continue;
+            };
+            if !owns_and_is_stale(&st, our, now, false) {
+                continue;
+            }
+            let _ = unlink_name(dir, &name);
+        }
+    }
+
+    fn remove_private_dir_at(parent: &File, name: &CStr, listed: &libc::stat) -> io::Result<()> {
+        let child = openat_dir(parent, name)?;
+        let meta = child.metadata()?;
+        if meta.dev() != listed.st_dev
+            || meta.ino() != listed.st_ino
+            || meta.uid() != our_euid()
+            || meta.file_type().is_symlink()
+            || !meta.is_dir()
+        {
+            return Ok(());
+        }
+        let children = list_dir_names(&child)?;
+        for child_name in &children {
+            let text = child_name.to_str().unwrap_or("");
+            if !is_private_child_name(text) {
+                return Ok(());
+            }
+            let Some(st) =
+                fstat_name(&child, child_name).map_err(|err| io::Error::other(err.to_string()))?
+            else {
+                continue;
+            };
+            if is_lnk(&st) || !is_reg(&st) {
+                return Ok(());
+            }
+        }
+        for child_name in &children {
+            unlink_name(&child, child_name)?;
+        }
+        let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn openat_dir(parent: &File, name: &CStr) -> io::Result<File> {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    fn list_dir_names(dir: &File) -> io::Result<Vec<CString>> {
+        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dirp = unsafe { libc::fdopendir(dup) };
+        if dirp.is_null() {
+            unsafe { libc::close(dup) };
+            return Err(io::Error::last_os_error());
+        }
+        let mut names = Vec::new();
+        loop {
+            unsafe { *libc::__errno_location() = 0 };
+            let ent = unsafe { libc::readdir(dirp) };
+            if ent.is_null() {
+                let err = unsafe { *libc::__errno_location() };
+                unsafe { libc::closedir(dirp) };
+                if err != 0 {
+                    return Err(io::Error::from_raw_os_error(err));
+                }
+                return Ok(names);
+            }
+            let raw = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let bytes = raw.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            names.push(CString::from(raw));
+        }
+    }
+
+    #[cfg(test)]
+    fn age_name(dir: &File, name: &CStr, seconds_ago: i64) -> io::Result<()> {
+        let now = unix_now();
+        let when = libc::timespec {
+            tv_sec: now.saturating_sub(seconds_ago),
+            tv_nsec: 0,
+        };
+        let times = [when, when];
+        let rc = unsafe {
+            libc::utimensat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -783,6 +1032,118 @@ mod linux {
         fn private_snapshot_dir_is_owner_only() {
             let dir = PrivateDir::create().unwrap();
             assert_eq!(mode_of(&dir.path), 0o700);
+        }
+
+        #[test]
+        fn owns_and_is_stale_rejects_foreign_uid_symlink_and_fresh() {
+            let our = our_euid();
+            let now = unix_now();
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            st.st_mode = libc::S_IFREG | 0o640;
+            st.st_uid = our;
+            st.st_mtime = now - 1_000;
+            assert!(owns_and_is_stale(&st, our, now, false));
+            st.st_uid = our.wrapping_add(1);
+            assert!(!owns_and_is_stale(&st, our, now, false));
+            st.st_uid = our;
+            st.st_mode = libc::S_IFLNK | 0o777;
+            assert!(!owns_and_is_stale(&st, our, now, false));
+            st.st_mode = libc::S_IFREG | 0o640;
+            st.st_mtime = now;
+            assert!(!owns_and_is_stale(&st, our, now, false));
+            st.st_mtime = now - 1_000;
+            st.st_mode = libc::S_IFDIR | 0o700;
+            assert!(owns_and_is_stale(&st, our, now, true));
+            assert!(!owns_and_is_stale(&st, our, now, false));
+        }
+
+        #[test]
+        fn sweep_removes_stale_artifacts_and_leaves_fresh_symlinks_and_foreign() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let opened = open_inbox(dir.path()).unwrap();
+            let stale_tmp = CString::new(format!(".data.db.{}.tmp", "ab".repeat(16))).unwrap();
+            let fresh_tmp = CString::new(format!(".data.db.{}.tmp", "cd".repeat(16))).unwrap();
+            let odd_tmp = CString::new(".data.db.not-ours.tmp").unwrap();
+            drop(openat_excl(&opened.dir, &stale_tmp).unwrap());
+            drop(openat_excl(&opened.dir, &fresh_tmp).unwrap());
+            drop(openat_excl(&opened.dir, &odd_tmp).unwrap());
+            age_name(&opened.dir, &stale_tmp, 1_000).unwrap();
+            age_name(&opened.dir, &odd_tmp, 1_000).unwrap();
+
+            let secret = dir.path().join("secret");
+            fs::write(&secret, b"keep").unwrap();
+            let link_tmp = format!(".data.db.{}.tmp", "ef".repeat(16));
+            std::os::unix::fs::symlink(&secret, dir.path().join(&link_tmp)).unwrap();
+            let link_c = CString::new(link_tmp.clone()).unwrap();
+            age_name(&opened.dir, &link_c, 1_000).unwrap();
+
+            let stale_priv =
+                std::env::temp_dir().join(format!("{PRIVATE_DIR_PREFIX}{}", "12".repeat(16)));
+            let fresh_priv =
+                std::env::temp_dir().join(format!("{PRIVATE_DIR_PREFIX}{}", "34".repeat(16)));
+            fs::create_dir(&stale_priv).unwrap();
+            fs::write(stale_priv.join("snapshot.db"), b"old").unwrap();
+            fs::create_dir(&fresh_priv).unwrap();
+            fs::write(fresh_priv.join("snapshot.db"), b"new").unwrap();
+            let temp_parent = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | O_DIRECTORY)
+                .open(std::env::temp_dir())
+                .unwrap();
+            let stale_priv_name =
+                CString::new(stale_priv.file_name().unwrap().as_encoded_bytes()).unwrap();
+            age_name(&temp_parent, &stale_priv_name, 1_000).unwrap();
+
+            let victim = dir.path().join("victim-dir");
+            fs::create_dir(&victim).unwrap();
+            fs::write(victim.join("keep"), b"keep").unwrap();
+            let link_priv =
+                std::env::temp_dir().join(format!("{PRIVATE_DIR_PREFIX}{}", "56".repeat(16)));
+            std::os::unix::fs::symlink(&victim, &link_priv).unwrap();
+
+            let foreign_tmp = CString::new(format!(".data.db.{}.tmp", "09".repeat(16))).unwrap();
+            drop(openat_excl(&opened.dir, &foreign_tmp).unwrap());
+            age_name(&opened.dir, &foreign_tmp, 1_000).unwrap();
+            let foreign_path = dir.path().join(foreign_tmp.to_str().unwrap());
+            let foreign_c = c_path(&foreign_path).unwrap();
+            let chowned = unsafe { libc::chown(foreign_c.as_ptr(), 65534, 65534) };
+            if chowned != 0 {
+                // This user cannot give the file away. The predicate test covers a foreign uid.
+                let _ = unlink_name(&opened.dir, &foreign_tmp);
+            }
+
+            sweep_stale_inbox_temps(&opened.dir);
+            sweep_stale_private_dirs();
+
+            assert!(
+                !dir.path().join(stale_tmp.to_str().unwrap()).exists(),
+                "stale inbox temp should be removed"
+            );
+            assert!(dir.path().join(fresh_tmp.to_str().unwrap()).is_file());
+            assert!(dir.path().join(odd_tmp.to_str().unwrap()).is_file());
+            assert!(fs::symlink_metadata(dir.path().join(&link_tmp))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&secret).unwrap(), b"keep");
+            assert!(!stale_priv.exists(), "stale private dir should be removed");
+            assert!(fresh_priv.is_dir());
+            assert_eq!(fs::read(fresh_priv.join("snapshot.db")).unwrap(), b"new");
+            assert!(fs::symlink_metadata(&link_priv)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
+            if chowned == 0 {
+                assert!(
+                    foreign_path.is_file(),
+                    "foreign-owned temp should be left alone"
+                );
+                let _ = unlink_name(&opened.dir, &foreign_tmp);
+            }
+
+            let _ = fs::remove_dir_all(&fresh_priv);
+            let _ = fs::remove_file(&link_priv);
         }
 
         #[test]

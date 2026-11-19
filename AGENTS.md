@@ -10,13 +10,13 @@ Rust CLI that turns personal wearable/health exports into a local brief. Insight
 | `analyze [--from DATE] [--to DATE]` | Rule engine; store findings |
 | `brief [--day DATE] [--week] [--llm] [--llm-backend grok\|local] [--out PATH]` | Day/week wellbeing brief |
 | `digest …` | Alias of `brief` |
-| `export --inbox DIR` | Rollback-mode snapshot as `DIR/data.db` (`GROKTOR_EXPORT_INBOX`). Live DB stays WAL. |
+| `export [--inbox DIR]` | Rollback-mode snapshot as `DIR/data.db`. Default inbox `/var/lib/warehouse-inbox/health` (`GROKTOR_EXPORT_INBOX`). Live DB stays WAL. |
 
 Global `--db PATH` or `GROKTOR_DB` overrides the default database (`~/.local/share/personal_groktor/data.db` on Linux).
 
 Typical loop: `ingest` → `analyze` (optional; `brief` re-runs rules) → `brief`.
 
-`export` writes one rollback-mode `data.db` for the warehouse loader. There is no default inbox path and no network listener. The snapshot is built with `VACUUM INTO` in a private `0700` directory. The inbox is opened once and every later inbox step uses that directory fd: `openat` of `.data.db.<random>.tmp` (`O_EXCL`, mode 0640), `renameat` over `data.db`, then `fsync` of the directory fd. Header bytes 18 and 19 of the snapshot are 1. Symlinks are refused. A busy live writer cannot make the export run past 60 seconds. Failure removes the temp file, leaves the previous `data.db`, and exits non-zero. The live database stays `journal_mode=WAL`.
+`export` writes one rollback-mode `data.db` for the warehouse loader. The default inbox is `/var/lib/warehouse-inbox/health` (`3750` `sam:warehouse`, parent `/var/lib/warehouse-inbox` is `0750` `root:warehouse`). Override it with `--inbox` or `GROKTOR_EXPORT_INBOX`. There is no network listener. Run it as sam. The snapshot is built with `VACUUM INTO` in a private `0700` directory, where `integrity_check` and the rollback journal check run before publish. The inbox is opened once and every later inbox step uses that directory fd: `openat` of `.data.db.<random>.tmp` (`O_EXCL`, mode 0640), `renameat` over `data.db`, then `fsync` of the directory fd. The published file is not reopened by name. Header bytes 18 and 19 of the snapshot are 1. Symlinks are refused. A busy live writer cannot make the export run past 60 seconds. The next export removes only this user's stale `groktor-export-<uuid>` directories and `.data.db.<uuid>.tmp` files older than 120 seconds, and it does not follow symlinks. Failure removes the temp file, leaves the previous `data.db`, and exits non-zero. The live database stays `journal_mode=WAL`.
 
 ## LLM
 

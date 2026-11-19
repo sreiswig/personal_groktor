@@ -6,7 +6,7 @@ use chrono::{NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use personal_groktor::analyze;
 use personal_groktor::brief::{self, BriefOptions};
-use personal_groktor::export;
+use personal_groktor::export::{self, DEFAULT_WAREHOUSE_INBOX};
 use personal_groktor::ingest;
 use personal_groktor::lab;
 use personal_groktor::llm::{ChatClient, LlmBackend};
@@ -139,7 +139,12 @@ enum Commands {
     /// Write a rollback-mode snapshot of the health database for the warehouse loader
     Export {
         /// Inbox directory. The snapshot is written as data.db in this directory.
-        #[arg(long, env = "GROKTOR_EXPORT_INBOX")]
+        /// Default: /var/lib/warehouse-inbox/health (3750 sam:warehouse).
+        #[arg(
+            long,
+            env = "GROKTOR_EXPORT_INBOX",
+            default_value = DEFAULT_WAREHOUSE_INBOX
+        )]
         inbox: PathBuf,
     },
 }
