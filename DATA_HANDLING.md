@@ -24,6 +24,7 @@ Personal GrokTor touches health-adjacent local data and optional LLM calls. Trea
 
 ## Exports & sharing
 
+- [ ] Run `export` as **sam**. The default inbox is `/var/lib/warehouse-inbox/health`: parent `/var/lib/warehouse-inbox` is `0750` `root:warehouse`, and `health` is `3750` `sam:warehouse`. It builds the snapshot with `VACUUM INTO` in a private mode `0700` directory, runs `integrity_check` and the rollback journal check on that private file, then publishes a mode `0640` file by `renameat` through the inbox directory fd. It does not reopen the published file by name. A 60 second watchdog aborts the export without replacing `data.db`. A later export deletes only this user's stale `groktor-export-<uuid>` directories and `.data.db.<uuid>.tmp` files older than 120 seconds, and it does not follow symlinks. Override the inbox with `--inbox` or `GROKTOR_EXPORT_INBOX` only for another local directory you trust. The command refuses a symlink inbox and a symlink `data.db`, and it does not change the live database's WAL mode.
 - [ ] Never commit real exports (JSON/CSV/SQLite copies) "for debugging."
 - [ ] If you need fixtures: synthesize fake rows; mark them `FIXTURE` / `SYNTHETIC`.
 - [ ] Before attaching files to issues/PRs: scan for names, dates of birth, device IDs, API keys.

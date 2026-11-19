@@ -802,6 +802,7 @@ dependencies = [
  "clap",
  "csv",
  "dirs",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

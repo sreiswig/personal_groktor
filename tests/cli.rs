@@ -171,7 +171,7 @@ fn help_and_version_succeed_without_creating_a_database() {
         stdout.contains("Turn personal health exports into clear, actionable wellbeing insight")
     );
     for name in [
-        "ingest", "analyze", "brief", "digest", "note", "lab", "status",
+        "ingest", "analyze", "brief", "digest", "note", "lab", "status", "export",
     ] {
         assert!(stdout.contains(name), "help missing {name}:\n{stdout}");
     }
@@ -194,7 +194,7 @@ fn help_and_version_succeed_without_creating_a_database() {
     assert!(via_help.expect_ok().contains("Usage:"));
 
     for command in [
-        "ingest", "analyze", "brief", "digest", "note", "lab", "status",
+        "ingest", "analyze", "brief", "digest", "note", "lab", "status", "export",
     ] {
         let out = sandbox.run(None, &[command, "--help"]);
         let stdout = out.expect_ok();
@@ -896,4 +896,70 @@ fn llm_switches_fail_closed_without_calling_a_backend() {
         !stderr.contains("connection") && !stderr.contains("timed out"),
         "model is required before any request:\n{stderr}"
     );
+}
+
+#[test]
+fn export_writes_rollback_snapshot_and_refuses_symlinks() {
+    let sandbox = Sandbox::new();
+    let csv = example("sample_metrics.csv");
+    sandbox.groktor(&["ingest", arg(&csv)]).expect_ok();
+
+    let help = sandbox.groktor(&["export", "--help"]);
+    let help_out = help.expect_ok();
+    assert!(help_out.contains("GROKTOR_EXPORT_INBOX"), "{help_out}");
+    assert!(help_out.contains("--inbox"), "{help_out}");
+
+    let inbox = sandbox.path("inbox");
+    fs::create_dir(&inbox).unwrap();
+    let exported = sandbox.groktor(&["export", "--inbox", arg(&inbox)]);
+    let stdout = exported.expect_ok();
+    let dest = inbox.join("data.db");
+    assert!(stdout.contains(&dest.display().to_string()), "{stdout}");
+    let bytes = fs::read(&dest).unwrap();
+    assert_eq!(&bytes[..16], b"SQLite format 3\0");
+    assert_eq!((bytes[18], bytes[19]), (1, 1));
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!inbox.join(format!("data.db{suffix}")).exists(), "{suffix}");
+    }
+    for entry in fs::read_dir(&inbox).unwrap() {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        assert!(!(name.starts_with('.') && name.ends_with(".tmp")), "{name}");
+    }
+    let live = fs::read(sandbox.db()).unwrap();
+    assert_eq!((live[18], live[19]), (2, 2));
+
+    let via_env = sandbox.path("inbox-env");
+    fs::create_dir(&via_env).unwrap();
+    let mut cmd = sandbox.command();
+    cmd.arg("--db").arg(sandbox.db());
+    cmd.env("GROKTOR_EXPORT_INBOX", &via_env);
+    cmd.arg("export");
+    let from_env = Captured::from(cmd.output().expect("spawn"));
+    from_env.expect_ok();
+    let env_bytes = fs::read(via_env.join("data.db")).unwrap();
+    assert_eq!((env_bytes[18], env_bytes[19]), (1, 1));
+
+    let secret = sandbox.path("secret.db");
+    fs::write(&secret, b"do-not-touch").unwrap();
+    let link_inbox = sandbox.path("link-inbox");
+    fs::create_dir(&link_inbox).unwrap();
+    std::os::unix::fs::symlink(&secret, link_inbox.join("data.db")).unwrap();
+    let refused = sandbox.groktor(&["export", "--inbox", arg(&link_inbox)]);
+    let stderr = refused.expect_err(1);
+    assert!(stderr.to_ascii_lowercase().contains("symlink"), "{stderr}");
+    assert_eq!(fs::read(&secret).unwrap(), b"do-not-touch");
+    assert!(fs::symlink_metadata(link_inbox.join("data.db"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let real = sandbox.path("real-inbox");
+    fs::create_dir(&real).unwrap();
+    let inbox_link = sandbox.path("inbox-link");
+    std::os::unix::fs::symlink(&real, &inbox_link).unwrap();
+    let refused_dir = sandbox.groktor(&["export", "--inbox", arg(&inbox_link)]);
+    let stderr = refused_dir.expect_err(1);
+    assert!(stderr.to_ascii_lowercase().contains("symlink"), "{stderr}");
+    assert!(!real.join("data.db").exists());
 }

@@ -6,6 +6,7 @@ use chrono::{NaiveDate, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use personal_groktor::analyze;
 use personal_groktor::brief::{self, BriefOptions};
+use personal_groktor::export::{self, DEFAULT_WAREHOUSE_INBOX};
 use personal_groktor::ingest;
 use personal_groktor::lab;
 use personal_groktor::llm::{ChatClient, LlmBackend};
@@ -134,6 +135,18 @@ enum Commands {
 
     /// Show database status
     Status,
+
+    /// Write a rollback-mode snapshot of the health database for the warehouse loader
+    Export {
+        /// Inbox directory. The snapshot is written as data.db in this directory.
+        /// Default: /var/lib/warehouse-inbox/health (3750 sam:warehouse).
+        #[arg(
+            long,
+            env = "GROKTOR_EXPORT_INBOX",
+            default_value = DEFAULT_WAREHOUSE_INBOX
+        )]
+        inbox: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,6 +306,7 @@ async fn run() -> personal_groktor::Result<()> {
         ),
         Commands::Lab { action } => cmd_lab(cli.db, action),
         Commands::Status => cmd_status(cli.db),
+        Commands::Export { inbox } => cmd_export(cli.db, inbox),
     }
 }
 
@@ -629,6 +643,13 @@ fn cmd_lab(db: Option<PathBuf>, action: LabCmd) -> personal_groktor::Result<()> 
             print!("{text}");
         }
     }
+    Ok(())
+}
+
+fn cmd_export(db: Option<PathBuf>, inbox: PathBuf) -> personal_groktor::Result<()> {
+    let store = open_store(db)?;
+    let dest = export::publish_snapshot(store.path(), &inbox)?;
+    println!("Wrote warehouse snapshot to {}", dest.display());
     Ok(())
 }
 

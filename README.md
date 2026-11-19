@@ -37,6 +37,7 @@ Rust CLI scaffold is in place:
 - [x] Local digests / **brief** + optional xAI Grok narrative
 - [x] Annotations (`note`) + N=1 lab (`lab start|day|report`) + digest cache tables
 - [x] Day and rolling-week briefs with confidence + context
+- [x] Warehouse inbox snapshot (`export`): one rollback-mode `data.db`, live DB stays WAL
 - [ ] Broader export parsers (Apple Health XML, Fitbit bulk, etc.) — see [`open_source_devices/apis/`](open_source_devices/apis/)
 - [ ] Open device adapters (PineTime, Bangle.js, Gadgetbridge, BLE HR, …) — see [`open_source_devices/`](open_source_devices/)
 - [ ] Research agent (literature harvest / FTS) — see [`docs/research_agent_v0.md`](docs/research_agent_v0.md)
@@ -115,6 +116,7 @@ cargo run -- brief --llm --llm-backend local
 | `note [--tag …] [-m …]` / `note list` | Log or list annotations |
 | `lab start\|day\|list\|show\|report\|…` | N=1 experiments |
 | `status` | DB path, metrics, notes, labs |
+| `export --inbox DIR` | Rollback-mode snapshot of the health DB as `DIR/data.db` |
 
 Global option: `--db PATH` (or `GROKTOR_DB`) to override the default database location  
 (`~/.local/share/personal_groktor/data.db` on Linux).
@@ -143,11 +145,37 @@ Common metric aliases (`rhr`, `hrv`, `steps`, …) map to the canonical schema a
 | `GROKTOR_LLM_MODEL` / `LLM_MODEL` | Local model id (required for `--llm-backend local`) |
 | `GROKTOR_LLM_API_KEY` / `LLM_API_KEY` | Local bearer token (optional; defaults to `local`) |
 | `GROKTOR_DB` | SQLite path override |
+| `GROKTOR_EXPORT_INBOX` | Inbox directory for `export` (same as `--inbox`; default `/var/lib/warehouse-inbox/health`) |
 | `RUST_LOG` | Tracing filter (e.g. `debug`) |
 
 `--llm` is the on-switch for `brief` / `digest`. `--llm-backend` selects the endpoint (default `grok`). Existing Grok usage is unchanged.
 
 For `--llm-backend local`, Groktor POSTs `{base}/chat/completions` and never falls back to a public URL. Point `GROKTOR_LLM_BASE` at a LAN or loopback server such as Spark vLLM (`http://127.0.0.1:8000/v1`).
+
+### Warehouse snapshot
+
+`export` writes one SQLite file for the personal data warehouse loader (`inputMode = snapshot` in [Nixos_Configs PR #34](https://github.com/sreiswig/Nixos_Configs/pull/34)). It does not open a network port. The live database stays in `journal_mode=WAL`.
+
+```bash
+personal_groktor export
+# default inbox: /var/lib/warehouse-inbox/health
+# or
+personal_groktor export --inbox /path/to/inbox
+export GROKTOR_EXPORT_INBOX=/path/to/inbox
+personal_groktor export
+```
+
+The default inbox is `/var/lib/warehouse-inbox/health`. Its parent `/var/lib/warehouse-inbox` is mode `0750` `root:warehouse`, and `health` is mode `3750` `sam:warehouse`. The directory must already exist. Override it with `--inbox` or `GROKTOR_EXPORT_INBOX`. The snapshot is always `{inbox}/data.db`. Run `export` as sam.
+
+Contract:
+
+- The snapshot is a consistent read of the live database, including commits that are still only in the live `-wal` file. It is built with `VACUUM INTO` in a private mode `0700` directory, then `journal_mode=DELETE` (rollback: header bytes 18 and 19 are 1) and `PRAGMA integrity_check` must return `ok`.
+- The inbox directory is opened once (`O_NOFOLLOW`, `O_DIRECTORY`). After that, every inbox step uses that directory fd (`openat`, `renameat`, `unlinkat`, `fsync`). The snapshot is placed there only at the end, as `.data.db.<random>.tmp` with mode `0640` and `O_EXCL`, then `renameat` over `data.db`, then `fsync` on the directory fd.
+- `integrity_check` and the rollback journal check run on that private file before it is copied. The published file is not opened again by name.
+- The whole export stops at 60 seconds. On timeout or any other failure the private files and the inbox temp name are removed, an existing `data.db` is left as it was, and the process exits non-zero. At the start of the next export, this process removes only its own stale `groktor-export-<uuid>` directories and `.data.db.<uuid>.tmp` files when they are older than 120 seconds, owned by this user, and not symlinks.
+- If `data.db` or the inbox directory is a symlink, the export refuses it and does not follow the link.
+
+Open the published file with `immutable=1`. On a setgid inbox directory the file inherits that group, so mode `0640` is what a group-readable loader expects. The snapshot is a copy of your health database for self-reflection, not medical advice.
 
 ## Project layout
 
@@ -155,6 +183,7 @@ For `--llm-backend local`, Groktor POSTs `{base}/chat/completions` and never fal
 src/
   main.rs          CLI entry
   lib.rs           Library root
+  export.rs        Rollback-mode snapshot for the warehouse inbox
   schema.rs        Metric, finding, annotation, experiment, digest types
   ingest/          CSV & JSON loaders
   normalize.rs     Raw → canonical metrics
